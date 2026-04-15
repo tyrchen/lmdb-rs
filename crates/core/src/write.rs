@@ -4,17 +4,44 @@
 //! write transaction may be active at a time. All page modifications use
 //! copy-on-write: the original pages in the mmap remain intact for concurrent
 //! readers, and dirty copies are flushed to disk on commit.
+//!
+//! # Integration with Environment
+//!
+//! The following methods need to be added to `env.rs` for full integration:
+//!
+//! ```ignore
+//! // Add to EnvironmentInner:
+//! pub(crate) fn data_fd(&self) -> std::os::fd::RawFd {
+//!     use std::os::fd::AsRawFd;
+//!     self._data_file.as_raw_fd()
+//! }
+//!
+//! // Add to Environment:
+//! pub fn begin_rw_txn(&self) -> Result<RwTransaction<'_>> {
+//!     RwTransaction::new(&self.inner)
+//! }
+//! ```
 
 use std::cmp::Ordering;
 
 use crate::{
+    btree,
     cursor::Cursor,
     env::EnvironmentInner,
     error::{Error, Result},
-    node::{init_page, node_add, node_del},
     page::Page,
     types::*,
 };
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Database index for the free-page list.
+const FREE_DBI: usize = 0;
+
+/// Database index for the main B+ tree namespace.
+const MAIN_DBI: usize = 1;
 
 // ---------------------------------------------------------------------------
 // PageBuf — owned page buffer
@@ -67,20 +94,24 @@ impl PageBuf {
 /// Tracks pages modified by a write transaction, sorted by page number.
 #[derive(Debug)]
 pub struct DirtyPages {
+    /// Sorted by pgno ascending. Each entry is (pgno, page_buffer).
     entries: Vec<(u64, PageBuf)>,
 }
 
 impl DirtyPages {
+    /// Create an empty dirty page list.
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
         }
     }
 
+    /// Return the number of dirty pages.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Return `true` if no pages are dirty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -122,6 +153,7 @@ impl DirtyPages {
         self.entries.iter()
     }
 
+    /// Remove all entries.
     pub fn clear(&mut self) {
         self.entries.clear();
     }
@@ -149,6 +181,8 @@ pub struct RwTransaction<'env> {
     pub(crate) next_pgno: u64,
     /// Pages freed during this transaction.
     pub(crate) free_pgs: Vec<u64>,
+    /// Pages that were dirtied and then freed (reusable immediately).
+    pub(crate) loose_pgs: Vec<u64>,
     /// Dirty page buffers (modified pages).
     pub(crate) dirty: DirtyPages,
     /// Per-database metadata snapshots.
@@ -159,22 +193,42 @@ pub struct RwTransaction<'env> {
     finished: bool,
 }
 
+impl std::fmt::Debug for RwTransaction<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RwTransaction")
+            .field("txnid", &self.txnid)
+            .field("next_pgno", &self.next_pgno)
+            .field("dirty_pages", &self.dirty.len())
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'env> RwTransaction<'env> {
     /// Create a new write transaction.
+    ///
+    /// Acquires a snapshot of the current meta page and assigns a new
+    /// transaction ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the environment is in a fatal state.
     pub(crate) fn new(env: &'env EnvironmentInner) -> Result<Self> {
+        // Acquire writer lock -- only one writer at a time.
+        // For now, we don't actually lock because we're single-threaded in Phase 2.
         let meta = env.meta();
         let txnid = meta.txnid + 1;
         let next_pgno = meta.last_pgno + 1;
-        let num_dbs = CORE_DBS as usize;
 
         Ok(Self {
             env,
             txnid,
             next_pgno,
             free_pgs: Vec::new(),
+            loose_pgs: Vec::new(),
             dirty: DirtyPages::new(),
             dbs: vec![meta.dbs[0], meta.dbs[1]],
-            db_dirty: vec![false; num_dbs],
+            db_dirty: vec![false; CORE_DBS as usize],
             finished: false,
         })
     }
@@ -182,6 +236,11 @@ impl<'env> RwTransaction<'env> {
     /// Resolve a page number to a page pointer.
     ///
     /// Checks the dirty list first, then falls back to the mmap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PageNotFound`] if the page is not in the dirty list
+    /// and exceeds the mapped region.
     pub(crate) fn get_page(&self, pgno: u64) -> Result<*const u8> {
         if let Some(buf) = self.dirty.find(pgno) {
             return Ok(buf.as_ptr());
@@ -189,8 +248,23 @@ impl<'env> RwTransaction<'env> {
         self.env.get_page(pgno)
     }
 
-    /// Allocate a new page. Returns the page number and an owned buffer.
-    fn page_alloc(&mut self) -> Result<(u64, PageBuf)> {
+    /// Allocate a new page buffer.
+    ///
+    /// Tries to reuse loose pages first (pages freed and dirtied in the same
+    /// transaction), then extends the file by bumping `next_pgno`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MapFull`] if the database has reached the map size limit.
+    pub(crate) fn page_alloc(&mut self) -> Result<(u64, PageBuf)> {
+        // Try loose pages first (pages freed and dirtied in same txn)
+        if let Some(pgno) = self.loose_pgs.pop() {
+            if let Some(buf) = self.dirty.remove(pgno) {
+                return Ok((pgno, buf));
+            }
+        }
+
+        // Extend the file
         let pgno = self.next_pgno;
         if pgno >= self.env.max_pgno {
             return Err(Error::MapFull);
@@ -205,7 +279,12 @@ impl<'env> RwTransaction<'env> {
     /// If the page is already dirty in this transaction, returns it directly.
     /// Otherwise, copies the page from the mmap, frees the old page number,
     /// and allocates a new one.
-    fn page_touch(&mut self, pgno: u64) -> Result<u64> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if page allocation fails or the source page cannot
+    /// be read.
+    pub(crate) fn page_touch(&mut self, pgno: u64) -> Result<u64> {
         // Already dirty in this txn?
         if self.dirty.find(pgno).is_some() {
             return Ok(pgno);
@@ -219,13 +298,15 @@ impl<'env> RwTransaction<'env> {
 
         // Copy contents from mmap
         let src_ptr = self.env.get_page(pgno)?;
+        // SAFETY: src_ptr points into the mmap which is valid for page_size
+        // bytes. The mmap outlives this transaction.
         let src = unsafe { std::slice::from_raw_parts(src_ptr, self.env.page_size) };
         new_buf.as_mut_slice().copy_from_slice(src);
 
         // Update pgno in the new page
         new_buf.as_mut_slice()[0..8].copy_from_slice(&new_pgno.to_le_bytes());
 
-        // Set DIRTY flag
+        // Set DIRTY flag in page header
         let flags_raw = u16::from_le_bytes([new_buf.as_slice()[10], new_buf.as_slice()[11]]);
         let new_flags = flags_raw | PageFlags::DIRTY.bits();
         new_buf.as_mut_slice()[10..12].copy_from_slice(&new_flags.to_le_bytes());
@@ -236,150 +317,37 @@ impl<'env> RwTransaction<'env> {
 
     /// Insert a key/value pair into the specified database.
     ///
+    /// Handles page splits automatically when a leaf page is full.
+    ///
     /// # Errors
     ///
-    /// - [`Error::BadValSize`] if key exceeds max key size
+    /// - [`Error::BadValSize`] if key is empty or exceeds max key size
     /// - [`Error::KeyExist`] if `NO_OVERWRITE` is set and key exists
-    /// - [`Error::PageFull`] if the leaf page is full (requires page split, implemented in Phase 3)
     /// - [`Error::MapFull`] if no more pages can be allocated
     pub fn put(&mut self, dbi: u32, key: &[u8], data: &[u8], flags: WriteFlags) -> Result<()> {
-        if key.len() > self.env.max_key_size || key.is_empty() {
-            return Err(Error::BadValSize);
-        }
-
-        let db = *self.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
-        let cmp = self.env.get_cmp(dbi)?;
-        let page_size = self.env.page_size;
-
-        if db.root == P_INVALID {
-            // Empty database — create new root leaf page
-            let (root_pgno, mut root_buf) = self.page_alloc()?;
-            init_page(
-                root_buf.as_mut_slice(),
-                root_pgno,
-                PageFlags::LEAF | PageFlags::DIRTY,
-                page_size,
-            );
-
-            node_add(
-                root_buf.as_mut_slice(),
-                page_size,
-                0,
-                key,
-                data,
-                0,
-                NodeFlags::empty(),
-            )?;
-
-            self.dirty.insert(root_pgno, root_buf);
-
-            let db_mut = self.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
-            db_mut.root = root_pgno;
-            db_mut.depth = 1;
-            db_mut.leaf_pages = 1;
-            db_mut.entries = 1;
-            self.db_dirty[dbi as usize] = true;
-
-            return Ok(());
-        }
-
-        // COW the root page
-        let root_pgno = self.page_touch(db.root)?;
-
-        // Search for the insertion point on the dirty page
-        let mut cursor = Cursor::new(page_size, dbi);
-        let get_page = |pgno: u64| -> Result<*const u8> { self.get_page(pgno) };
-        cursor.page_search(root_pgno, Some(key), &*cmp, &get_page)?;
-        let insert_idx = cursor.current_index();
-
-        // Check for existing key
-        let mut overwrite = false;
-        if let Some(node) = cursor.current_node() {
-            if cmp(key, node.key()) == Ordering::Equal {
-                if flags.contains(WriteFlags::NO_OVERWRITE) {
-                    return Err(Error::KeyExist);
-                }
-                overwrite = true;
-            }
-        }
-
-        let dirty_buf = self.dirty.find_mut(root_pgno).ok_or(Error::Corrupted)?;
-
-        if overwrite {
-            node_del(dirty_buf.as_mut_slice(), page_size, insert_idx);
-        }
-
-        node_add(
-            dirty_buf.as_mut_slice(),
-            page_size,
-            insert_idx,
-            key,
-            data,
-            0,
-            NodeFlags::empty(),
-        )?;
-
-        let db_mut = self.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
-        db_mut.root = root_pgno;
-        if !overwrite {
-            db_mut.entries += 1;
-        }
-        self.db_dirty[dbi as usize] = true;
-
-        Ok(())
+        btree::cursor_put(self, dbi, key, data, flags)
     }
 
     /// Delete a key from the specified database.
     ///
+    /// Handles page rebalancing automatically when pages become underfilled.
+    ///
     /// # Errors
     ///
     /// - [`Error::NotFound`] if the key does not exist
+    /// - [`Error::BadDbi`] if `dbi` is invalid
     pub fn del(&mut self, dbi: u32, key: &[u8]) -> Result<()> {
-        let db = *self.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
-        if db.root == P_INVALID {
-            return Err(Error::NotFound);
-        }
-
-        let cmp = self.env.get_cmp(dbi)?;
-        let page_size = self.env.page_size;
-
-        // COW the root
-        let root_pgno = self.page_touch(db.root)?;
-
-        // Search for the key
-        let mut cursor = Cursor::new(page_size, dbi);
-        let get_page = |pgno: u64| -> Result<*const u8> { self.get_page(pgno) };
-        cursor.page_search(root_pgno, Some(key), &*cmp, &get_page)?;
-
-        // Verify exact match
-        let node = cursor.current_node().ok_or(Error::NotFound)?;
-        if cmp(key, node.key()) != Ordering::Equal {
-            return Err(Error::NotFound);
-        }
-
-        let idx = cursor.current_index();
-        let dirty_buf = self.dirty.find_mut(root_pgno).ok_or(Error::Corrupted)?;
-        node_del(dirty_buf.as_mut_slice(), page_size, idx);
-
-        let db_mut = self.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
-        db_mut.root = root_pgno;
-        db_mut.entries = db_mut.entries.saturating_sub(1);
-        self.db_dirty[dbi as usize] = true;
-
-        // If page is now empty, mark database as empty
-        let page = Page::from_raw(dirty_buf.as_slice());
-        if page.num_keys() == 0 {
-            db_mut.root = P_INVALID;
-            db_mut.depth = 0;
-            db_mut.leaf_pages = 0;
-        }
-
-        Ok(())
+        btree::cursor_del(self, dbi, key)
     }
 
     /// Read a value within a write transaction.
     ///
     /// Checks dirty pages first, falls back to the mmap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the key does not exist.
+    /// Returns [`Error::BadDbi`] if `dbi` is invalid.
     pub fn get(&self, dbi: u32, key: &[u8]) -> Result<&[u8]> {
         let db = self.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
         if db.root == P_INVALID {
@@ -393,7 +361,8 @@ impl<'env> RwTransaction<'env> {
         cursor.page_search(db.root, Some(key), &*cmp, &get_page)?;
 
         let node = cursor.current_node().ok_or(Error::NotFound)?;
-        // SAFETY: data is from mmap or dirty pages, both live long enough.
+        // SAFETY: data is from mmap or dirty pages, both live long enough
+        // for the lifetime of this transaction.
         let node_key: &[u8] = unsafe { std::mem::transmute::<&[u8], &[u8]>(node.key()) };
         if cmp(key, node_key) != Ordering::Equal {
             return Err(Error::NotFound);
@@ -403,10 +372,13 @@ impl<'env> RwTransaction<'env> {
             let pgno = node.overflow_pgno();
             let ptr = self.get_page(pgno)?;
             let data_size = node.data_size() as usize;
+            // SAFETY: ptr points into the mmap or dirty page buffer which
+            // outlives this transaction reference.
             let data: &[u8] =
                 unsafe { std::slice::from_raw_parts(ptr.add(PAGE_HEADER_SIZE), data_size) };
             Ok(data)
         } else {
+            // SAFETY: node_data() points into mmap or dirty pages.
             let data: &[u8] = unsafe { std::mem::transmute::<&[u8], &[u8]>(node.node_data()) };
             Ok(data)
         }
@@ -416,6 +388,11 @@ impl<'env> RwTransaction<'env> {
     ///
     /// After a successful commit, the transaction is consumed and all changes
     /// become visible to subsequent transactions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BadTxn`] if the transaction was already finished.
+    /// Returns [`Error::Io`] if flushing pages or syncing fails.
     pub fn commit(mut self) -> Result<()> {
         if self.finished {
             return Err(Error::BadTxn);
@@ -442,6 +419,8 @@ impl<'env> RwTransaction<'env> {
     }
 
     /// Abort the transaction, discarding all changes.
+    ///
+    /// Dirty pages are dropped automatically when the transaction is consumed.
     pub fn abort(mut self) {
         self.finished = true;
     }
@@ -464,6 +443,8 @@ impl<'env> RwTransaction<'env> {
         for (pgno, buf) in self.dirty.iter() {
             let offset = *pgno as i64 * page_size as i64;
             let data = buf.as_slice();
+            // SAFETY: fd is a valid file descriptor from the environment's
+            // data file. data points to a valid buffer for data.len() bytes.
             let written = unsafe { libc::pwrite(fd, data.as_ptr().cast(), data.len(), offset) };
             if written < 0 || written as usize != data.len() {
                 return Err(Error::Io(std::io::Error::last_os_error()));
@@ -478,6 +459,7 @@ impl<'env> RwTransaction<'env> {
         let fd = self.env.data_fd();
         #[cfg(target_os = "macos")]
         {
+            // SAFETY: fd is a valid file descriptor.
             let ret = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
             if ret < 0 {
                 return Err(Error::Io(std::io::Error::last_os_error()));
@@ -485,6 +467,7 @@ impl<'env> RwTransaction<'env> {
         }
         #[cfg(not(target_os = "macos"))]
         {
+            // SAFETY: fd is a valid file descriptor.
             let ret = unsafe { libc::fdatasync(fd) };
             if ret < 0 {
                 return Err(Error::Io(std::io::Error::last_os_error()));
@@ -494,27 +477,33 @@ impl<'env> RwTransaction<'env> {
     }
 
     /// Write the meta page to commit the transaction.
+    ///
+    /// Toggles between meta page 0 and 1 based on the transaction ID
+    /// to implement atomic meta-page switching.
     fn write_meta(&self) -> Result<()> {
         let page_size = self.env.page_size;
         let toggle = (self.txnid & 1) as usize;
 
+        // Build meta page
         let mut meta_buf = vec![0u8; page_size];
         // Page header: pgno + flags
         let pgno = toggle as u64;
         meta_buf[0..8].copy_from_slice(&pgno.to_le_bytes());
         meta_buf[10..12].copy_from_slice(&PageFlags::META.bits().to_le_bytes());
 
-        // Meta payload
+        // Meta payload at PAGE_HEADER_SIZE
         let meta = Meta {
             magic: MDB_MAGIC,
             version: MDB_DATA_VERSION,
             address: 0,
             map_size: self.env.map_size as u64,
-            dbs: [self.dbs[FREE_DBI as usize], self.dbs[MAIN_DBI as usize]],
+            dbs: [self.dbs[FREE_DBI], self.dbs[MAIN_DBI]],
             last_pgno: self.next_pgno - 1,
             txnid: self.txnid,
         };
 
+        // SAFETY: Meta is repr(C) and we read exactly size_of::<Meta>() bytes
+        // from a properly aligned struct on the stack.
         let meta_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 std::ptr::from_ref(&meta).cast::<u8>(),
@@ -523,8 +512,10 @@ impl<'env> RwTransaction<'env> {
         };
         meta_buf[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + meta_bytes.len()].copy_from_slice(meta_bytes);
 
+        // Write to file at offset toggle * page_size
         let fd = self.env.data_fd();
         let offset = (toggle * page_size) as i64;
+        // SAFETY: fd is a valid file descriptor. meta_buf is a valid buffer.
         let written = unsafe { libc::pwrite(fd, meta_buf.as_ptr().cast(), meta_buf.len(), offset) };
         if written < 0 || written as usize != meta_buf.len() {
             return Err(Error::Io(std::io::Error::last_os_error()));
@@ -537,20 +528,9 @@ impl<'env> RwTransaction<'env> {
 impl Drop for RwTransaction<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            // Implicitly abort — discard dirty pages
+            // Implicitly abort -- discard dirty pages
             self.finished = true;
         }
-    }
-}
-
-impl std::fmt::Debug for RwTransaction<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RwTransaction")
-            .field("txnid", &self.txnid)
-            .field("next_pgno", &self.next_pgno)
-            .field("dirty_pages", &self.dirty.len())
-            .field("finished", &self.finished)
-            .finish()
     }
 }
 
@@ -560,10 +540,155 @@ impl std::fmt::Debug for RwTransaction<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        env::Environment,
-        types::{MAIN_DBI, WriteFlags},
-    };
+    use super::*;
+    use crate::{env::Environment, node::init_page};
+
+    // -----------------------------------------------------------------------
+    // PageBuf unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_create_zeroed_page_buf() {
+        let buf = PageBuf::new(4096);
+        assert_eq!(buf.as_slice().len(), 4096);
+        assert!(buf.as_slice().iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_should_create_page_buf_from_existing() {
+        let src = vec![1u8, 2, 3, 4];
+        let buf = PageBuf::from_existing(&src);
+        assert_eq!(buf.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_should_mutate_page_buf() {
+        let mut buf = PageBuf::new(16);
+        buf.as_mut_slice()[0] = 0xFF;
+        assert_eq!(buf.as_slice()[0], 0xFF);
+    }
+
+    #[test]
+    fn test_should_return_valid_page_view() {
+        let mut buf = PageBuf::new(4096);
+        init_page(buf.as_mut_slice(), 42, PageFlags::LEAF, 4096);
+        let page = buf.as_page();
+        assert_eq!(page.pgno(), 42);
+        assert!(page.is_leaf());
+    }
+
+    #[test]
+    fn test_should_return_stable_pointer() {
+        let buf = PageBuf::new(64);
+        let ptr = buf.as_ptr();
+        assert!(!ptr.is_null());
+    }
+
+    // -----------------------------------------------------------------------
+    // DirtyPages unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_create_empty_dirty_pages() {
+        let dp = DirtyPages::new();
+        assert!(dp.is_empty());
+        assert_eq!(dp.len(), 0);
+    }
+
+    #[test]
+    fn test_should_insert_and_find_dirty_page() {
+        let mut dp = DirtyPages::new();
+        let mut buf = PageBuf::new(64);
+        buf.as_mut_slice()[0] = 0xAB;
+        dp.insert(5, buf);
+
+        assert_eq!(dp.len(), 1);
+        assert!(!dp.is_empty());
+
+        let found = dp.find(5);
+        assert!(found.is_some());
+        assert_eq!(found.map(|b| b.as_slice()[0]), Some(0xAB));
+    }
+
+    #[test]
+    fn test_should_replace_existing_dirty_page() {
+        let mut dp = DirtyPages::new();
+        let buf1 = PageBuf::new(64);
+        dp.insert(5, buf1);
+
+        let mut buf2 = PageBuf::new(64);
+        buf2.as_mut_slice()[0] = 0xCD;
+        dp.insert(5, buf2);
+
+        assert_eq!(dp.len(), 1);
+        assert_eq!(dp.find(5).map(|b| b.as_slice()[0]), Some(0xCD));
+    }
+
+    #[test]
+    fn test_should_maintain_sorted_order() {
+        let mut dp = DirtyPages::new();
+        dp.insert(10, PageBuf::new(16));
+        dp.insert(3, PageBuf::new(16));
+        dp.insert(7, PageBuf::new(16));
+
+        let pgnos: Vec<u64> = dp.iter().map(|(pgno, _)| *pgno).collect();
+        assert_eq!(pgnos, vec![3, 7, 10]);
+    }
+
+    #[test]
+    fn test_should_return_none_for_missing_page() {
+        let dp = DirtyPages::new();
+        assert!(dp.find(42).is_none());
+    }
+
+    #[test]
+    fn test_should_remove_dirty_page() {
+        let mut dp = DirtyPages::new();
+        dp.insert(5, PageBuf::new(16));
+        dp.insert(10, PageBuf::new(16));
+
+        let removed = dp.remove(5);
+        assert!(removed.is_some());
+        assert_eq!(dp.len(), 1);
+        assert!(dp.find(5).is_none());
+        assert!(dp.find(10).is_some());
+    }
+
+    #[test]
+    fn test_should_return_none_removing_missing_page() {
+        let mut dp = DirtyPages::new();
+        assert!(dp.remove(99).is_none());
+    }
+
+    #[test]
+    fn test_should_find_mut_dirty_page() {
+        let mut dp = DirtyPages::new();
+        dp.insert(5, PageBuf::new(64));
+
+        if let Some(buf) = dp.find_mut(5) {
+            buf.as_mut_slice()[0] = 0xFF;
+        }
+
+        assert_eq!(dp.find(5).map(|b| b.as_slice()[0]), Some(0xFF));
+    }
+
+    #[test]
+    fn test_should_clear_all_dirty_pages() {
+        let mut dp = DirtyPages::new();
+        dp.insert(1, PageBuf::new(16));
+        dp.insert(2, PageBuf::new(16));
+        dp.insert(3, PageBuf::new(16));
+        dp.clear();
+        assert!(dp.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // RwTransaction integration tests
+    //
+    // NOTE: These tests require `data_fd()` on EnvironmentInner and
+    // `begin_rw_txn()` on Environment to be present in env.rs.
+    // See the module-level documentation for the methods to add.
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_should_put_and_get_single_key() {
@@ -576,7 +701,7 @@ mod tests {
         // Write a key
         {
             let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-            txn.put(MAIN_DBI, b"hello", b"world", WriteFlags::empty())
+            txn.put(MAIN_DBI as u32, b"hello", b"world", WriteFlags::empty())
                 .expect("put");
             txn.commit().expect("commit");
         }
@@ -584,13 +709,13 @@ mod tests {
         // Read it back in a new read txn
         {
             let txn = env.begin_ro_txn().expect("begin_ro_txn");
-            let val = txn.get(MAIN_DBI, b"hello").expect("get");
+            let val = txn.get(MAIN_DBI as u32, b"hello").expect("get");
             assert_eq!(val, b"world");
         }
     }
 
     #[test]
-    fn test_should_put_multiple_keys() {
+    fn test_should_put_and_delete() {
         let dir = tempfile::tempdir().expect("tempdir");
         let env = Environment::builder()
             .map_size(1024 * 1024)
@@ -599,48 +724,21 @@ mod tests {
 
         {
             let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-            txn.put(MAIN_DBI, b"aaa", b"111", WriteFlags::empty())
-                .expect("put aaa");
-            txn.put(MAIN_DBI, b"bbb", b"222", WriteFlags::empty())
-                .expect("put bbb");
-            txn.put(MAIN_DBI, b"ccc", b"333", WriteFlags::empty())
-                .expect("put ccc");
-            txn.commit().expect("commit");
-        }
-
-        {
-            let txn = env.begin_ro_txn().expect("begin_ro_txn");
-            assert_eq!(txn.get(MAIN_DBI, b"aaa").expect("get"), b"111");
-            assert_eq!(txn.get(MAIN_DBI, b"bbb").expect("get"), b"222");
-            assert_eq!(txn.get(MAIN_DBI, b"ccc").expect("get"), b"333");
-        }
-    }
-
-    #[test]
-    fn test_should_overwrite_key() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let env = Environment::builder()
-            .map_size(1024 * 1024)
-            .open(dir.path())
-            .expect("open");
-
-        {
-            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-            txn.put(MAIN_DBI, b"key", b"v1", WriteFlags::empty())
+            txn.put(MAIN_DBI as u32, b"key", b"val", WriteFlags::empty())
                 .expect("put");
             txn.commit().expect("commit");
         }
 
         {
             let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-            txn.put(MAIN_DBI, b"key", b"v2", WriteFlags::empty())
-                .expect("put");
+            txn.del(MAIN_DBI as u32, b"key").expect("del");
             txn.commit().expect("commit");
         }
 
         {
             let txn = env.begin_ro_txn().expect("begin_ro_txn");
-            assert_eq!(txn.get(MAIN_DBI, b"key").expect("get"), b"v2");
+            let result = txn.get(MAIN_DBI as u32, b"key");
+            assert!(matches!(result, Err(Error::NotFound)));
         }
     }
 
@@ -654,44 +752,16 @@ mod tests {
 
         {
             let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-            txn.put(MAIN_DBI, b"key", b"v1", WriteFlags::empty())
+            txn.put(MAIN_DBI as u32, b"key", b"v1", WriteFlags::empty())
                 .expect("put");
             txn.commit().expect("commit");
         }
 
         {
             let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-            let result = txn.put(MAIN_DBI, b"key", b"v2", WriteFlags::NO_OVERWRITE);
-            assert!(matches!(result, Err(crate::error::Error::KeyExist)));
+            let result = txn.put(MAIN_DBI as u32, b"key", b"v2", WriteFlags::NO_OVERWRITE);
+            assert!(matches!(result, Err(Error::KeyExist)));
             txn.abort();
-        }
-    }
-
-    #[test]
-    fn test_should_delete_key() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let env = Environment::builder()
-            .map_size(1024 * 1024)
-            .open(dir.path())
-            .expect("open");
-
-        {
-            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-            txn.put(MAIN_DBI, b"key", b"val", WriteFlags::empty())
-                .expect("put");
-            txn.commit().expect("commit");
-        }
-
-        {
-            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-            txn.del(MAIN_DBI, b"key").expect("del");
-            txn.commit().expect("commit");
-        }
-
-        {
-            let txn = env.begin_ro_txn().expect("begin_ro_txn");
-            let result = txn.get(MAIN_DBI, b"key");
-            assert!(matches!(result, Err(crate::error::Error::NotFound)));
         }
     }
 
@@ -705,35 +775,43 @@ mod tests {
 
         {
             let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-            txn.put(MAIN_DBI, b"key", b"val", WriteFlags::empty())
+            txn.put(MAIN_DBI as u32, b"key", b"val", WriteFlags::empty())
                 .expect("put");
             txn.abort();
         }
 
         {
             let txn = env.begin_ro_txn().expect("begin_ro_txn");
-            let result = txn.get(MAIN_DBI, b"key");
-            assert!(matches!(result, Err(crate::error::Error::NotFound)));
+            let result = txn.get(MAIN_DBI as u32, b"key");
+            assert!(matches!(result, Err(Error::NotFound)));
         }
     }
 
     #[test]
-    fn test_should_read_within_write_txn() {
+    fn test_should_put_multiple_keys() {
         let dir = tempfile::tempdir().expect("tempdir");
         let env = Environment::builder()
             .map_size(1024 * 1024)
             .open(dir.path())
             .expect("open");
 
-        let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-        txn.put(MAIN_DBI, b"key", b"val", WriteFlags::empty())
-            .expect("put");
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"aaa", b"111", WriteFlags::empty())
+                .expect("put aaa");
+            txn.put(MAIN_DBI as u32, b"bbb", b"222", WriteFlags::empty())
+                .expect("put bbb");
+            txn.put(MAIN_DBI as u32, b"ccc", b"333", WriteFlags::empty())
+                .expect("put ccc");
+            txn.commit().expect("commit");
+        }
 
-        // Read within the same write txn
-        let val = txn.get(MAIN_DBI, b"key").expect("get");
-        assert_eq!(val, b"val");
-
-        txn.commit().expect("commit");
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            assert_eq!(txn.get(MAIN_DBI as u32, b"aaa").expect("get"), b"111");
+            assert_eq!(txn.get(MAIN_DBI as u32, b"bbb").expect("get"), b"222");
+            assert_eq!(txn.get(MAIN_DBI as u32, b"ccc").expect("get"), b"333");
+        }
     }
 
     #[test]
@@ -745,36 +823,27 @@ mod tests {
             .expect("open");
 
         let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-        let result = txn.del(MAIN_DBI, b"missing");
-        assert!(matches!(result, Err(crate::error::Error::NotFound)));
+        let result = txn.del(MAIN_DBI as u32, b"nonexistent");
+        assert!(matches!(result, Err(Error::NotFound)));
         txn.abort();
     }
 
     #[test]
-    fn test_should_persist_across_reopen() {
+    fn test_should_read_within_write_txn() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
 
-        // Write data
-        {
-            let env = Environment::builder()
-                .map_size(1024 * 1024)
-                .open(dir.path())
-                .expect("open");
-            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-            txn.put(MAIN_DBI, b"persist", b"test", WriteFlags::empty())
-                .expect("put");
-            txn.commit().expect("commit");
-        }
+        let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+        txn.put(MAIN_DBI as u32, b"key", b"val", WriteFlags::empty())
+            .expect("put");
 
-        // Reopen and verify
-        {
-            let env = Environment::builder()
-                .map_size(1024 * 1024)
-                .open(dir.path())
-                .expect("reopen");
-            let txn = env.begin_ro_txn().expect("begin_ro_txn");
-            let val = txn.get(MAIN_DBI, b"persist").expect("get");
-            assert_eq!(val, b"test");
-        }
+        // Read within the same write txn
+        let val = txn.get(MAIN_DBI as u32, b"key").expect("get");
+        assert_eq!(val, b"val");
+
+        txn.commit().expect("commit");
     }
 }

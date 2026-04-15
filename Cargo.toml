@@ -13,14 +13,14 @@ homepage = "https://github.com/TODO"
 readme = "README.md"
 
 [workspace.dependencies]
-bitflags = "2.9"
+bitflags = "2.11"
 libc = "0.2"
 memmap2 = "0.9"
-thiserror = "2.0.12"
+thiserror = "2.0.18"
 tracing = "0.1"
 
 # dev
-tempfile = "3.19"
+tempfile = "3.27"
 
 # workspace crates
 lmdb-rs-core = { path = "crates/core" }

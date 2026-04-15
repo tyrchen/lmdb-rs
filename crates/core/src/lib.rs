@@ -4,6 +4,7 @@
 //! with MVCC (Multi-Version Concurrency Control) for single-writer,
 //! multi-reader concurrent access.
 
+pub mod btree;
 pub mod cmp;
 pub mod cursor;
 pub mod env;
