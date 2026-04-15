@@ -91,11 +91,13 @@ pub fn node_add(
     let lower = u16::from_le_bytes([page[12], page[13]]) as usize;
     let upper = u16::from_le_bytes([page[14], page[15]]) as usize;
 
-    let node_size = if is_branch {
+    let raw_node_size = if is_branch {
         NODE_HEADER_SIZE + key.len()
     } else {
         NODE_HEADER_SIZE + key.len() + data.len()
     };
+    // Align node size to even boundary (matching LMDB's EVEN macro)
+    let node_size = even(raw_node_size);
 
     // Need 2 bytes for the pointer + node_size bytes for the node
     if upper - lower < 2 + node_size {
@@ -178,9 +180,9 @@ pub fn node_del(page: &mut [u8], _page_size: usize, idx: usize) {
     let del_ptr_pos = PAGE_HEADER_SIZE + idx * 2;
     let del_offset = u16::from_le_bytes([page[del_ptr_pos], page[del_ptr_pos + 1]]) as usize;
 
-    // Calculate deleted node's size
+    // Calculate deleted node's size (even-aligned to match node_add)
     let node_ksize = u16::from_le_bytes([page[del_offset + 6], page[del_offset + 7]]) as usize;
-    let node_size = if is_branch {
+    let raw_size = if is_branch {
         NODE_HEADER_SIZE + node_ksize
     } else {
         let lo = u16::from_le_bytes([page[del_offset], page[del_offset + 1]]) as u32;
@@ -188,6 +190,7 @@ pub fn node_del(page: &mut [u8], _page_size: usize, idx: usize) {
         let data_size = (lo | (hi << 16)) as usize;
         NODE_HEADER_SIZE + node_ksize + data_size
     };
+    let node_size = even(raw_size);
 
     // Remove pointer by shifting left
     if idx + 1 < num_keys {

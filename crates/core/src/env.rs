@@ -57,74 +57,8 @@ const DEFAULT_READERS: u32 = 126;
 /// Maximum key size (511 bytes, matching LMDB default for 4096-byte pages).
 const MAX_KEY_SIZE: usize = 511;
 
-// ---------------------------------------------------------------------------
-// EnvFlags
-// ---------------------------------------------------------------------------
-
-bitflags::bitflags! {
-    /// Flags that modify environment behaviour.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct EnvFlags: u32 {
-        /// Use a fixed address for the mmap region (unsupported, accepted for
-        /// flag compatibility).
-        const FIXED_MAP   = 0x01;
-        /// Do not use a subdirectory — treat `path` as the data file itself.
-        const NO_SUB_DIR  = 0x4000;
-        /// Open the environment in read-only mode.
-        const READ_ONLY   = 0x2_0000;
-        /// Do not perform `msync` after every transaction.
-        const NO_SYNC     = 0x1_0000;
-        /// Flush system buffers only once per transaction.
-        const MAP_ASYNC   = 0x10_0000;
-        /// Do not use `mmap` for writes (write syscalls only).
-        const WRITE_MAP   = 0x8_0000;
-        /// Do not use Thread-Local Storage.
-        const NO_TLS      = 0x20_0000;
-        /// Do not lock the environment (caller manages locking).
-        const NO_LOCK     = 0x40_0000;
-        /// Turn off readahead.
-        const NO_READAHEAD = 0x80_0000;
-        /// Do not initialise `malloc`'d memory before writing.
-        const NO_MEM_INIT  = 0x100_0000;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Public stat / info types
-// ---------------------------------------------------------------------------
-
-/// Database statistics returned by [`Environment::stat`] and
-/// [`RoTransaction::db_stat`](crate::txn::RoTransaction::db_stat).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stat {
-    /// Size of a database page in bytes.
-    pub page_size: u32,
-    /// Depth (height) of the B+ tree.
-    pub depth: u32,
-    /// Number of internal (branch) pages.
-    pub branch_pages: u64,
-    /// Number of leaf pages.
-    pub leaf_pages: u64,
-    /// Number of overflow pages.
-    pub overflow_pages: u64,
-    /// Total number of data items.
-    pub entries: u64,
-}
-
-/// Environment information returned by [`Environment::info`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EnvInfo {
-    /// Size of the memory map.
-    pub map_size: u64,
-    /// Last used page number.
-    pub last_pgno: u64,
-    /// Last committed transaction ID.
-    pub last_txnid: u64,
-    /// Maximum number of reader slots.
-    pub max_readers: u32,
-    /// Number of reader slots in use (always 0 for now).
-    pub num_readers: u32,
-}
+// Re-export types used in the public API from their canonical location.
+pub use crate::types::{EnvFlags, EnvInfo, Stat};
 
 // ---------------------------------------------------------------------------
 // EnvironmentBuilder
@@ -604,7 +538,7 @@ impl Environment {
     pub fn info(&self) -> EnvInfo {
         let meta = self.inner.meta();
         EnvInfo {
-            map_size: self.inner.map_size as u64,
+            map_size: self.inner.map_size,
             last_pgno: meta.last_pgno,
             last_txnid: meta.txnid,
             max_readers: self.inner.max_readers,

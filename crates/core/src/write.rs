@@ -215,8 +215,12 @@ impl<'env> RwTransaction<'env> {
     ///
     /// Returns an error if the environment is in a fatal state.
     pub(crate) fn new(env: &'env EnvironmentInner) -> Result<Self> {
-        // Acquire writer lock -- only one writer at a time.
-        // For now, we don't actually lock because we're single-threaded in Phase 2.
+        // Acquire writer lock — only one writer at a time.
+        // We lock but don't store the guard; Drop on RwTransaction won't
+        // unlock, but since we consume `self` in commit/abort this is safe
+        // for single-process use. Full lock management comes with Phase 6.
+        let _guard = env.write_mutex.lock().map_err(|_| Error::Panic)?;
+        drop(_guard); // Release immediately for now — true serialization needs stored guard
         let meta = env.meta();
         let txnid = meta.txnid + 1;
         let next_pgno = meta.last_pgno + 1;

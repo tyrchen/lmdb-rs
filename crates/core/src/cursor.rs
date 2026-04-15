@@ -390,31 +390,36 @@ impl Cursor {
     where
         F: Fn(u64) -> Result<*const u8>,
     {
-        if self.snum < 2 {
-            return Err(Error::NotFound);
+        // Iteratively ascend the tree until we find a parent with a sibling
+        // in the requested direction.
+        loop {
+            if self.snum < 2 {
+                return Err(Error::NotFound);
+            }
+
+            self.pop_page();
+
+            let idx = self.indices[self.top as usize] as usize;
+            let page = self.current_page();
+            let nkeys = page.num_keys();
+
+            if right {
+                if idx + 1 < nkeys {
+                    self.indices[self.top as usize] = (idx + 1) as u16;
+                    break;
+                }
+                // Parent exhausted — continue ascending.
+            } else {
+                if idx > 0 {
+                    self.indices[self.top as usize] = (idx - 1) as u16;
+                    break;
+                }
+                // Parent exhausted — continue ascending.
+            }
         }
 
-        // Pop current leaf/child page.
-        self.pop_page();
-
-        let idx = self.indices[self.top as usize] as usize;
+        // Descend into the sibling child.
         let page = self.current_page();
-        let nkeys = page.num_keys();
-
-        if right {
-            if idx + 1 >= nkeys {
-                // Parent has no more children to the right — ascend further.
-                return self.sibling(right, get_page);
-            }
-            self.indices[self.top as usize] = (idx + 1) as u16;
-        } else {
-            if idx == 0 {
-                // Parent has no more children to the left — ascend further.
-                return self.sibling(right, get_page);
-            }
-            self.indices[self.top as usize] = (idx - 1) as u16;
-        }
-
         let new_idx = self.indices[self.top as usize] as usize;
         let child_pgno = page.node(new_idx).child_pgno();
         let child_ptr = get_page(child_pgno)?;
