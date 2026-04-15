@@ -161,6 +161,79 @@ pub fn node_add(
     Ok(())
 }
 
+/// Add a bigdata (overflow) node at position `idx` in a leaf page.
+///
+/// The node stores `overflow_pgno` as an 8-byte LE inline value and records
+/// the `actual_data_size` in the node header's lo/hi fields so that the
+/// read path knows how many bytes to fetch from the overflow pages.
+///
+/// # Errors
+///
+/// Returns [`Error::PageFull`] if there is not enough space on the page
+/// for the new pointer and node data.
+pub fn node_add_bigdata(
+    page: &mut [u8],
+    _page_size: usize,
+    idx: usize,
+    key: &[u8],
+    overflow_pgno: u64,
+    actual_data_size: u32,
+) -> Result<()> {
+    let lower = u16::from_le_bytes([page[12], page[13]]) as usize;
+    let upper = u16::from_le_bytes([page[14], page[15]]) as usize;
+
+    // Inline data is the 8-byte overflow pgno
+    let inline_data_len = 8usize;
+    let raw_node_size = NODE_HEADER_SIZE + key.len() + inline_data_len;
+    let node_size = even(raw_node_size);
+
+    if upper - lower < 2 + node_size {
+        return Err(Error::PageFull);
+    }
+
+    let num_keys = (lower - PAGE_HEADER_SIZE) / 2;
+
+    // Shift pointers at positions >= idx to make room
+    if idx < num_keys {
+        let src = PAGE_HEADER_SIZE + idx * 2;
+        let dst = PAGE_HEADER_SIZE + (idx + 1) * 2;
+        let len = (num_keys - idx) * 2;
+        page.copy_within(src..src + len, dst);
+    }
+
+    let node_offset = upper - node_size;
+
+    // Write pointer at idx
+    let ptr_offset = PAGE_HEADER_SIZE + idx * 2;
+    page[ptr_offset..ptr_offset + 2].copy_from_slice(&(node_offset as u16).to_le_bytes());
+
+    // Write node header: lo/hi encode actual_data_size, flags = BIGDATA
+    let lo = (actual_data_size & 0xFFFF) as u16;
+    let hi = ((actual_data_size >> 16) & 0xFFFF) as u16;
+    page[node_offset..node_offset + 2].copy_from_slice(&lo.to_le_bytes());
+    page[node_offset + 2..node_offset + 4].copy_from_slice(&hi.to_le_bytes());
+    page[node_offset + 4..node_offset + 6]
+        .copy_from_slice(&NodeFlags::BIGDATA.bits().to_le_bytes());
+
+    // Write key size and key
+    let ks = key.len() as u16;
+    page[node_offset + 6..node_offset + 8].copy_from_slice(&ks.to_le_bytes());
+    page[node_offset + NODE_HEADER_SIZE..node_offset + NODE_HEADER_SIZE + key.len()]
+        .copy_from_slice(key);
+
+    // Write inline data: 8-byte overflow pgno
+    let data_start = node_offset + NODE_HEADER_SIZE + key.len();
+    page[data_start..data_start + 8].copy_from_slice(&overflow_pgno.to_le_bytes());
+
+    // Update lower and upper
+    let new_lower = (lower + 2) as u16;
+    let new_upper = node_offset as u16;
+    page[12..14].copy_from_slice(&new_lower.to_le_bytes());
+    page[14..16].copy_from_slice(&new_upper.to_le_bytes());
+
+    Ok(())
+}
+
 /// Remove the node at position `idx` from the page.
 ///
 /// This compacts the node data area so that space is reclaimed. All node
@@ -185,10 +258,20 @@ pub fn node_del(page: &mut [u8], _page_size: usize, idx: usize) {
     let raw_size = if is_branch {
         NODE_HEADER_SIZE + node_ksize
     } else {
-        let lo = u16::from_le_bytes([page[del_offset], page[del_offset + 1]]) as u32;
-        let hi = u16::from_le_bytes([page[del_offset + 2], page[del_offset + 3]]) as u32;
-        let data_size = (lo | (hi << 16)) as usize;
-        NODE_HEADER_SIZE + node_ksize + data_size
+        let node_flags = NodeFlags::from_bits_truncate(u16::from_le_bytes([
+            page[del_offset + 4],
+            page[del_offset + 5],
+        ]));
+        let inline_data_size = if node_flags.contains(NodeFlags::BIGDATA) {
+            // BIGDATA nodes store 8-byte overflow pgno inline, regardless
+            // of the actual data size encoded in lo/hi.
+            8
+        } else {
+            let lo = u16::from_le_bytes([page[del_offset], page[del_offset + 1]]) as u32;
+            let hi = u16::from_le_bytes([page[del_offset + 2], page[del_offset + 3]]) as u32;
+            (lo | (hi << 16)) as usize
+        };
+        NODE_HEADER_SIZE + node_ksize + inline_data_size
     };
     let node_size = even(raw_size);
 

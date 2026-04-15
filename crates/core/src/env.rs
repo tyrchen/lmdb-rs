@@ -358,7 +358,10 @@ impl Environment {
                 version: MDB_DATA_VERSION,
                 address: 0,
                 map_size: config.map_size as u64,
-                dbs: [empty_dbstat(page_size as u32); 2],
+                dbs: [
+                    empty_free_dbstat(page_size as u32),
+                    empty_dbstat(page_size as u32),
+                ],
                 last_pgno: NUM_METAS as u64 - 1,
                 txnid: 0,
             };
@@ -692,6 +695,23 @@ fn empty_dbstat(page_size: u32) -> DbStat {
     DbStat {
         pad: page_size,
         flags: 0,
+        depth: 0,
+        branch_pages: 0,
+        leaf_pages: 0,
+        overflow_pages: 0,
+        entries: 0,
+        root: P_INVALID,
+    }
+}
+
+/// Create an empty [`DbStat`] for FREE_DBI with `INTEGER_KEY` flag set.
+///
+/// The free-page database uses native-byte-order unsigned integer keys
+/// (transaction IDs), matching LMDB's `MDB_INTEGERKEY` convention.
+fn empty_free_dbstat(page_size: u32) -> DbStat {
+    DbStat {
+        pad: page_size,
+        flags: 0x08, // INTEGER_KEY
         depth: 0,
         branch_pages: 0,
         leaf_pages: 0,

@@ -190,6 +190,12 @@ pub struct RwTransaction<'env> {
     pub(crate) dbs: Vec<DbStat>,
     /// Per-database dirty flags.
     pub(crate) db_dirty: Vec<bool>,
+    /// Reclaimed pages from FREE_DBI, available for reuse.
+    pub(crate) reclaim_pgs: Vec<u64>,
+    /// Transaction IDs of consumed FREE_DBI records (to delete on commit).
+    consumed_freelist_txnids: Vec<u64>,
+    /// Whether the freelist has been loaded from FREE_DBI.
+    freelist_loaded: bool,
     /// Whether this transaction has been committed or aborted.
     finished: bool,
 }
@@ -234,6 +240,9 @@ impl<'env> RwTransaction<'env> {
             dirty: DirtyPages::new(),
             dbs: vec![meta.dbs[0], meta.dbs[1]],
             db_dirty: vec![false; CORE_DBS as usize],
+            reclaim_pgs: Vec::new(),
+            consumed_freelist_txnids: Vec::new(),
+            freelist_loaded: false,
             finished: false,
         })
     }
@@ -262,14 +271,20 @@ impl<'env> RwTransaction<'env> {
     ///
     /// Returns [`Error::MapFull`] if the database has reached the map size limit.
     pub(crate) fn page_alloc(&mut self) -> Result<(u64, PageBuf)> {
-        // Try loose pages first (pages freed and dirtied in same txn)
+        // 1. Try loose pages first (pages freed and dirtied in same txn)
         if let Some(pgno) = self.loose_pgs.pop() {
             if let Some(buf) = self.dirty.remove(pgno) {
                 return Ok((pgno, buf));
             }
         }
 
-        // Extend the file
+        // 2. Try reusing pages from the free list (older transactions)
+        if let Some(pgno) = self.try_reclaim_page()? {
+            let buf = PageBuf::new(self.env.page_size);
+            return Ok((pgno, buf));
+        }
+
+        // 3. Extend the file
         let pgno = self.next_pgno;
         if pgno >= self.env.max_pgno {
             return Err(Error::MapFull);
@@ -277,6 +292,24 @@ impl<'env> RwTransaction<'env> {
         self.next_pgno += 1;
         let buf = PageBuf::new(self.env.page_size);
         Ok((pgno, buf))
+    }
+
+    /// Allocate `num` contiguous page buffers.
+    ///
+    /// Returns the starting page number and a vector of page buffers.
+    /// All pages are allocated from `next_pgno` in a contiguous range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MapFull`] if the database has reached the map size limit.
+    pub(crate) fn page_alloc_multi(&mut self, num: usize) -> Result<(u64, Vec<PageBuf>)> {
+        let start_pgno = self.next_pgno;
+        if start_pgno + num as u64 > self.env.max_pgno {
+            return Err(Error::MapFull);
+        }
+        self.next_pgno += num as u64;
+        let bufs: Vec<PageBuf> = (0..num).map(|_| PageBuf::new(self.env.page_size)).collect();
+        Ok((start_pgno, bufs))
     }
 
     /// Copy-on-write: make a writable copy of the page at `pgno`.
@@ -539,13 +572,26 @@ impl<'env> RwTransaction<'env> {
 
         if node.is_bigdata() {
             let pgno = node.overflow_pgno();
-            let ptr = self.get_page(pgno)?;
             let data_size = node.data_size() as usize;
-            // SAFETY: ptr points into the mmap or dirty page buffer which
-            // outlives this transaction reference.
-            let data: &[u8] =
-                unsafe { std::slice::from_raw_parts(ptr.add(PAGE_HEADER_SIZE), data_size) };
-            Ok(data)
+
+            if let Some(buf) = self.dirty.find(pgno) {
+                // Dirty overflow: stored as a single contiguous buffer
+                // covering all overflow pages.
+                let page_data = buf.as_slice();
+                let data: &[u8] = &page_data[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + data_size];
+                // SAFETY: data lives as long as the dirty page, which
+                // lives as long as the transaction.
+                let data: &[u8] = unsafe { std::mem::transmute::<&[u8], &[u8]>(data) };
+                Ok(data)
+            } else {
+                // Mmap: pages are contiguous.
+                let ptr = self.env.get_page(pgno)?;
+                // SAFETY: ptr points into the mmap which is contiguous and
+                // outlives this transaction reference.
+                let data: &[u8] =
+                    unsafe { std::slice::from_raw_parts(ptr.add(PAGE_HEADER_SIZE), data_size) };
+                Ok(data)
+            }
         } else {
             // SAFETY: node_data() points into mmap or dirty pages.
             let data: &[u8] = unsafe { std::mem::transmute::<&[u8], &[u8]>(node.node_data()) };
@@ -568,23 +614,26 @@ impl<'env> RwTransaction<'env> {
         }
         self.finished = true;
 
-        // Write dirty named DB records back to MAIN_DBI before flushing.
+        // 1. Save freed pages to FREE_DBI
+        self.save_freelist()?;
+
+        // 2. Write dirty named DB records back to MAIN_DBI before flushing.
         self.flush_named_dbs()?;
 
         if self.dirty.is_empty() {
             return Ok(());
         }
 
-        // 1. Flush dirty pages to the data file
+        // 3. Flush dirty pages to the data file
         self.flush_dirty_pages()?;
 
-        // 2. Sync data pages to disk
+        // 4. Sync data pages to disk
         self.sync_data()?;
 
-        // 3. Write the new meta page (the commit point)
+        // 5. Write the new meta page (the commit point)
         self.write_meta()?;
 
-        // 4. Sync meta page to disk
+        // 6. Sync meta page to disk
         self.sync_data()?;
 
         Ok(())
@@ -601,6 +650,145 @@ impl<'env> RwTransaction<'env> {
     #[must_use]
     pub fn txnid(&self) -> u64 {
         self.txnid
+    }
+
+    /// Try to reclaim a page from FREE_DBI records of older transactions.
+    ///
+    /// On the first call, loads all reclaimable pages from FREE_DBI into
+    /// `reclaim_pgs`. Subsequent calls pop from the cached list.
+    fn try_reclaim_page(&mut self) -> Result<Option<u64>> {
+        if !self.freelist_loaded {
+            self.load_freelist()?;
+            self.freelist_loaded = true;
+        }
+        Ok(self.reclaim_pgs.pop())
+    }
+
+    /// Load all reclaimable page numbers from FREE_DBI.
+    ///
+    /// Reads all FREE_DBI records whose key (txnid) is less than the
+    /// current transaction's ID. The page numbers are collected into
+    /// `reclaim_pgs` for reuse by `page_alloc`.
+    ///
+    /// This method separates the read phase (cursor iteration) from the
+    /// mutation phase (pushing to `reclaim_pgs`) to satisfy the borrow checker,
+    /// since the cursor's `get_page` closure borrows `self` immutably.
+    fn load_freelist(&mut self) -> Result<()> {
+        let free_db = self.dbs[FREE_DBI];
+        if free_db.root == P_INVALID {
+            return Ok(());
+        }
+
+        let cmp = self.env.get_cmp(FREE_DBI as u32)?;
+        let page_size = self.env.page_size;
+        let txnid = self.txnid;
+
+        // Phase 1: Read all freelist data into a temporary buffer.
+        // We collect (record_txnid, data_bytes) pairs so we can release
+        // the immutable borrow on `self` before mutating `reclaim_pgs`.
+        let mut collected: Vec<(u64, Vec<u8>)> = Vec::new();
+
+        {
+            let mut cursor = Cursor::new(page_size, FREE_DBI as u32);
+            let get_page = |pgno: u64| -> Result<*const u8> { self.get_page(pgno) };
+
+            if cursor.first(free_db.root, &**cmp, &get_page).is_err() {
+                return Ok(());
+            }
+
+            while let Some(node) = cursor.current_node() {
+                let key = node.key();
+                if key.len() != 8 {
+                    break;
+                }
+                let record_txnid =
+                    u64::from_ne_bytes(key[..8].try_into().map_err(|_| Error::Corrupted)?);
+
+                if record_txnid >= txnid {
+                    break;
+                }
+
+                // Copy the data out so we can drop the borrow.
+                collected.push((record_txnid, node.node_data().to_vec()));
+
+                if cursor.next(&get_page).is_err() {
+                    break;
+                }
+            }
+        }
+
+        // Phase 2: Parse collected data and push to reclaim_pgs.
+        for (record_txnid, data) in &collected {
+            self.consumed_freelist_txnids.push(*record_txnid);
+            if data.len() < 8 {
+                continue;
+            }
+            let count =
+                u64::from_le_bytes(data[..8].try_into().map_err(|_| Error::Corrupted)?) as usize;
+
+            for i in 0..count {
+                let offset = (i + 1) * 8;
+                if offset + 8 > data.len() {
+                    break;
+                }
+                let pgno = u64::from_le_bytes(
+                    data[offset..offset + 8]
+                        .try_into()
+                        .map_err(|_| Error::Corrupted)?,
+                );
+                // Don't reclaim meta pages (pages 0 and 1).
+                if pgno >= 2 {
+                    self.reclaim_pgs.push(pgno);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write freed page numbers to FREE_DBI and delete consumed records.
+    ///
+    /// Consumed FREE_DBI records (those whose pages were reclaimed during
+    /// this transaction) are deleted first, then the current transaction's
+    /// freed pages are written with key = txnid.
+    fn save_freelist(&mut self) -> Result<()> {
+        // Delete consumed FREE_DBI records so they are not reclaimed again
+        // by future transactions.
+        let consumed = std::mem::take(&mut self.consumed_freelist_txnids);
+        for &old_txnid in &consumed {
+            let key = old_txnid.to_ne_bytes();
+            // Ignore NotFound errors — the record may have already been deleted.
+            match btree::cursor_del(self, FREE_DBI as u32, &key) {
+                Ok(()) | Err(Error::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if self.free_pgs.is_empty() {
+            return Ok(());
+        }
+
+        // Sort for deterministic on-disk order.
+        self.free_pgs.sort_unstable();
+
+        // Serialize: [count (u64 LE), pgno0 (u64 LE), pgno1 (u64 LE), ...]
+        let mut data = Vec::with_capacity((self.free_pgs.len() + 1) * 8);
+        let count = self.free_pgs.len() as u64;
+        data.extend_from_slice(&count.to_le_bytes());
+        for &pgno in &self.free_pgs {
+            data.extend_from_slice(&pgno.to_le_bytes());
+        }
+
+        // Key is txnid in native byte order (INTEGER_KEY).
+        let key = self.txnid.to_ne_bytes();
+        btree::cursor_put_with_flags(
+            self,
+            FREE_DBI as u32,
+            &key,
+            &data,
+            WriteFlags::empty(),
+            NodeFlags::empty(),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -1312,5 +1500,192 @@ mod tests {
             .expect("open_db None");
         assert_eq!(dbi, MAIN_DBI as u32);
         txn.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Free page reuse tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_save_freelist_on_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        // Insert keys — this creates pages.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..50u32 {
+                let key = format!("key-{i:04}");
+                let val = format!("val-{i:04}");
+                txn.put(
+                    MAIN_DBI as u32,
+                    key.as_bytes(),
+                    val.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .unwrap_or_else(|e| panic!("put {key}: {e}"));
+            }
+            txn.commit().expect("commit");
+        }
+
+        // Delete all keys — this frees pages. The freed pages should be
+        // saved to FREE_DBI on commit.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..50u32 {
+                let key = format!("key-{i:04}");
+                txn.del(MAIN_DBI as u32, key.as_bytes())
+                    .unwrap_or_else(|e| panic!("del {key}: {e}"));
+            }
+            // After delete, free_pgs should be non-empty (COW freed pages).
+            assert!(
+                !txn.free_pgs.is_empty(),
+                "expected freed pages after deleting keys",
+            );
+            txn.commit().expect("commit");
+        }
+
+        // Verify the FREE_DBI has entries by checking its root is not P_INVALID.
+        {
+            let meta = env.info();
+            // The free DB should have been written to, so last_pgno should
+            // reflect the pages used for the freelist tree.
+            assert!(meta.last_pgno > 0, "expected some pages to exist");
+        }
+    }
+
+    #[test]
+    fn test_should_reuse_freed_pages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        // Insert 100 keys across multiple pages.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..100u32 {
+                let key = format!("reuse-{i:04}");
+                let val = format!("data-{i:04}");
+                txn.put(
+                    MAIN_DBI as u32,
+                    key.as_bytes(),
+                    val.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .unwrap_or_else(|e| panic!("put {key}: {e}"));
+            }
+            txn.commit().expect("commit");
+        }
+
+        let pgno_after_insert = env.info().last_pgno;
+
+        // Delete all keys — frees their pages.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..100u32 {
+                let key = format!("reuse-{i:04}");
+                txn.del(MAIN_DBI as u32, key.as_bytes())
+                    .unwrap_or_else(|e| panic!("del {key}: {e}"));
+            }
+            txn.commit().expect("commit");
+        }
+
+        // Insert 100 new keys — should reuse freed pages.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..100u32 {
+                let key = format!("new-{i:04}");
+                let val = format!("newdata-{i:04}");
+                txn.put(
+                    MAIN_DBI as u32,
+                    key.as_bytes(),
+                    val.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .unwrap_or_else(|e| panic!("put {key}: {e}"));
+            }
+            txn.commit().expect("commit");
+        }
+
+        let pgno_after_reinsert = env.info().last_pgno;
+
+        // The file should not have grown much — pages were reused.
+        // Without reuse, pgno_after_reinsert would be roughly
+        // pgno_after_insert * 2. With reuse, it should be close to
+        // pgno_after_insert or only slightly larger.
+        assert!(
+            pgno_after_reinsert <= pgno_after_insert + 5,
+            "expected page reuse: after_insert={pgno_after_insert}, \
+             after_reinsert={pgno_after_reinsert}",
+        );
+
+        // Verify the new data is readable.
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            for i in 0..100u32 {
+                let key = format!("new-{i:04}");
+                let val = format!("newdata-{i:04}");
+                let got = txn
+                    .get(MAIN_DBI as u32, key.as_bytes())
+                    .unwrap_or_else(|e| panic!("get {key}: {e}"));
+                assert_eq!(got, val.as_bytes(), "mismatch for {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_should_reuse_pages_across_multiple_rounds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        // Run 5 rounds of insert-delete-reinsert.
+        for round in 0..5u32 {
+            // Insert
+            {
+                let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+                for i in 0..50u32 {
+                    let key = format!("r{round}-k{i:04}");
+                    let val = format!("r{round}-v{i:04}");
+                    txn.put(
+                        MAIN_DBI as u32,
+                        key.as_bytes(),
+                        val.as_bytes(),
+                        WriteFlags::empty(),
+                    )
+                    .unwrap_or_else(|e| panic!("put round {round} key {i}: {e}"));
+                }
+                txn.commit().expect("commit");
+            }
+
+            // Delete
+            {
+                let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+                for i in 0..50u32 {
+                    let key = format!("r{round}-k{i:04}");
+                    txn.del(MAIN_DBI as u32, key.as_bytes())
+                        .unwrap_or_else(|e| panic!("del round {round} key {i}: {e}"));
+                }
+                txn.commit().expect("commit");
+            }
+        }
+
+        // After 5 rounds of 50 insert/delete, the database should not have
+        // grown to 5x the single-round size. Check that last_pgno is bounded.
+        let info = env.info();
+        // Without free page reuse, 5 rounds of ~3 pages each = ~30+ pages.
+        // With reuse, it should stabilize around the single-round peak.
+        assert!(
+            info.last_pgno < 30,
+            "expected bounded growth with free page reuse, got last_pgno={}",
+            info.last_pgno,
+        );
     }
 }

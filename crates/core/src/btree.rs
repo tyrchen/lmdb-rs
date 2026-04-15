@@ -11,10 +11,10 @@ use std::cmp::Ordering;
 use crate::{
     cmp::CmpFn,
     error::{Error, Result},
-    node::{init_page, leaf_size, node_add, node_del},
+    node::{init_page, leaf_size, node_add, node_add_bigdata, node_del},
     page::Page,
     types::*,
-    write::RwTransaction,
+    write::{PageBuf, RwTransaction},
 };
 
 // ---------------------------------------------------------------------------
@@ -43,6 +43,8 @@ struct LeafEntry {
     key: Vec<u8>,
     data: Vec<u8>,
     flags: NodeFlags,
+    /// For BIGDATA nodes, the actual data size stored in the node header.
+    actual_data_size: Option<u32>,
 }
 
 /// A branch entry collected during a split.
@@ -100,6 +102,10 @@ pub fn cursor_put_with_flags(
 
     let db = *txn.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
     let page_size = txn.env.page_size;
+    let node_max = txn.env.node_max;
+
+    // Check if the value requires overflow pages.
+    let needs_overflow = NODE_HEADER_SIZE + key.len() + data.len() > node_max;
 
     if db.root == P_INVALID {
         // Empty database -- create a new root leaf page.
@@ -110,16 +116,32 @@ pub fn cursor_put_with_flags(
             PageFlags::LEAF | PageFlags::DIRTY,
             page_size,
         );
-        node_add(
-            root_buf.as_mut_slice(),
-            page_size,
-            0,
-            key,
-            data,
-            0,
-            node_flags,
-        )?;
-        txn.dirty.insert(root_pgno, root_buf);
+
+        if needs_overflow {
+            let (overflow_pgno, num_pages) = write_overflow_pages(txn, data)?;
+            node_add_bigdata(
+                root_buf.as_mut_slice(),
+                page_size,
+                0,
+                key,
+                overflow_pgno,
+                data.len() as u32,
+            )?;
+            txn.dirty.insert(root_pgno, root_buf);
+            let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+            db_mut.overflow_pages += num_pages as u64;
+        } else {
+            node_add(
+                root_buf.as_mut_slice(),
+                page_size,
+                0,
+                key,
+                data,
+                0,
+                node_flags,
+            )?;
+            txn.dirty.insert(root_pgno, root_buf);
+        }
 
         let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
         db_mut.root = root_pgno;
@@ -150,46 +172,93 @@ pub fn cursor_put_with_flags(
         overwrite = true;
     }
 
-    // If overwriting, delete the old node first.
+    // If overwriting, free old overflow pages before deleting the node.
     if overwrite {
+        free_overflow_if_bigdata(txn, dbi, leaf_pgno, insert_idx, page_size)?;
         let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
         node_del(buf.as_mut_slice(), page_size, insert_idx);
     }
 
-    // Attempt insertion.
-    let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
-    let add_result = node_add(
-        buf.as_mut_slice(),
-        page_size,
-        insert_idx,
-        key,
-        data,
-        0,
-        node_flags,
-    );
+    // If the value needs overflow pages, allocate them now.
+    if needs_overflow {
+        let (overflow_pgno, num_pages) = write_overflow_pages(txn, data)?;
+        let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        let add_result = node_add_bigdata(
+            buf.as_mut_slice(),
+            page_size,
+            insert_idx,
+            key,
+            overflow_pgno,
+            data.len() as u32,
+        );
+        match add_result {
+            Ok(()) => {
+                let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+                db_mut.root = path[0].pgno;
+                db_mut.overflow_pages += num_pages as u64;
+                if !overwrite {
+                    db_mut.entries += 1;
+                }
+                txn.db_dirty[dbi as usize] = true;
+                Ok(())
+            }
+            Err(Error::PageFull) => {
+                // Split with the overflow reference (8-byte pgno as data).
+                let pgno_bytes = overflow_pgno.to_le_bytes();
+                split_and_insert_bigdata(
+                    txn,
+                    dbi,
+                    &path,
+                    key,
+                    &pgno_bytes,
+                    data.len() as u32,
+                    insert_idx,
+                    &**cmp,
+                )?;
+                let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+                db_mut.overflow_pages += num_pages as u64;
+                if !overwrite {
+                    db_mut.entries += 1;
+                }
+                txn.db_dirty[dbi as usize] = true;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        // Attempt inline insertion.
+        let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        let add_result = node_add(
+            buf.as_mut_slice(),
+            page_size,
+            insert_idx,
+            key,
+            data,
+            0,
+            node_flags,
+        );
 
-    match add_result {
-        Ok(()) => {
-            // Success -- update database metadata.
-            let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
-            db_mut.root = path[0].pgno;
-            if !overwrite {
-                db_mut.entries += 1;
+        match add_result {
+            Ok(()) => {
+                let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+                db_mut.root = path[0].pgno;
+                if !overwrite {
+                    db_mut.entries += 1;
+                }
+                txn.db_dirty[dbi as usize] = true;
+                Ok(())
             }
-            txn.db_dirty[dbi as usize] = true;
-            Ok(())
-        }
-        Err(Error::PageFull) => {
-            // The leaf is full -- split and insert.
-            split_and_insert(txn, dbi, &path, key, data, node_flags, insert_idx, &**cmp)?;
-            let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
-            if !overwrite {
-                db_mut.entries += 1;
+            Err(Error::PageFull) => {
+                split_and_insert(txn, dbi, &path, key, data, node_flags, insert_idx, &**cmp)?;
+                let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+                if !overwrite {
+                    db_mut.entries += 1;
+                }
+                txn.db_dirty[dbi as usize] = true;
+                Ok(())
             }
-            txn.db_dirty[dbi as usize] = true;
-            Ok(())
+            Err(e) => Err(e),
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -227,6 +296,9 @@ pub fn cursor_del(txn: &mut RwTransaction<'_>, dbi: u32, key: &[u8]) -> Result<(
             return Err(Error::NotFound);
         }
     }
+
+    // Free overflow pages if this is a BIGDATA node.
+    free_overflow_if_bigdata(txn, dbi, leaf_pgno, idx, page_size)?;
 
     // Delete the node.
     let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
@@ -456,10 +528,16 @@ fn split_and_insert(
     let mut entries: Vec<LeafEntry> = Vec::with_capacity(nkeys + 1);
     for i in 0..nkeys {
         let node = leaf_page.node(i);
+        let ads = if node.is_bigdata() {
+            Some(node.data_size())
+        } else {
+            None
+        };
         entries.push(LeafEntry {
             key: node.key().to_vec(),
             data: node.node_data().to_vec(),
             flags: node.flags(),
+            actual_data_size: ads,
         });
     }
 
@@ -470,6 +548,7 @@ fn split_and_insert(
             key: key.to_vec(),
             data: data.to_vec(),
             flags,
+            actual_data_size: None,
         },
     );
 
@@ -497,28 +576,12 @@ fn split_and_insert(
 
     // Populate the left page.
     for (i, entry) in entries[..split_idx].iter().enumerate() {
-        node_add(
-            left_buf.as_mut_slice(),
-            page_size,
-            i,
-            &entry.key,
-            &entry.data,
-            0,
-            entry.flags,
-        )?;
+        add_leaf_entry(left_buf.as_mut_slice(), page_size, i, entry)?;
     }
 
     // Populate the right page.
     for (i, entry) in entries[split_idx..].iter().enumerate() {
-        node_add(
-            right_buf.as_mut_slice(),
-            page_size,
-            i,
-            &entry.key,
-            &entry.data,
-            0,
-            entry.flags,
-        )?;
+        add_leaf_entry(right_buf.as_mut_slice(), page_size, i, entry)?;
     }
 
     // The separator key is the first key on the right page.
@@ -899,15 +962,7 @@ fn rebalance(txn: &mut RwTransaction<'_>, dbi: u32, path: &TreePath) -> Result<(
     );
 
     for (i, entry) in all_entries.iter().enumerate() {
-        node_add(
-            buf.as_mut_slice(),
-            page_size,
-            i,
-            &entry.key,
-            &entry.data,
-            0,
-            entry.flags,
-        )?;
+        add_leaf_entry(buf.as_mut_slice(), page_size, i, entry)?;
     }
 
     // Remove the right page's entry from the parent.
@@ -990,13 +1045,239 @@ fn collect_leaf_entries(
     let mut entries = Vec::with_capacity(nkeys);
     for i in 0..nkeys {
         let node = page.node(i);
+        let ads = if node.is_bigdata() {
+            Some(node.data_size())
+        } else {
+            None
+        };
         entries.push(LeafEntry {
             key: node.key().to_vec(),
             data: node.node_data().to_vec(),
             flags: node.flags(),
+            actual_data_size: ads,
         });
     }
     Ok(entries)
+}
+
+/// Add a leaf entry to a page, handling BIGDATA nodes correctly.
+///
+/// For BIGDATA entries, uses `node_add_bigdata` to encode the actual data
+/// size in the header. For normal entries, uses `node_add`.
+fn add_leaf_entry(page: &mut [u8], page_size: usize, idx: usize, entry: &LeafEntry) -> Result<()> {
+    if let Some(ads) = entry.actual_data_size {
+        let mut pgno_bytes = [0u8; 8];
+        pgno_bytes.copy_from_slice(&entry.data[..8]);
+        let overflow_pgno = u64::from_le_bytes(pgno_bytes);
+        node_add_bigdata(page, page_size, idx, &entry.key, overflow_pgno, ads)
+    } else {
+        node_add(
+            page,
+            page_size,
+            idx,
+            &entry.key,
+            &entry.data,
+            0,
+            entry.flags,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal: overflow page helpers
+// ---------------------------------------------------------------------------
+
+/// Allocate overflow pages and write data into them.
+///
+/// Returns `(overflow_pgno, num_pages)` where `overflow_pgno` is the first
+/// page number and `num_pages` is the count of contiguous pages allocated.
+///
+/// The overflow data is stored as a single large contiguous `PageBuf`
+/// at the starting pgno. This allows within-transaction reads to access the
+/// data via a single pointer without reassembly.
+fn write_overflow_pages(txn: &mut RwTransaction<'_>, data: &[u8]) -> Result<(u64, usize)> {
+    let page_size = txn.env.page_size;
+    let num_pages = (PAGE_HEADER_SIZE + data.len()).div_ceil(page_size);
+    let total_size = num_pages * page_size;
+
+    let (start_pgno, _bufs) = txn.page_alloc_multi(num_pages)?;
+
+    // Create a single large buffer covering all overflow pages.
+    let mut big_buf = PageBuf::new(total_size);
+    let buf = big_buf.as_mut_slice();
+
+    // Initialize the first overflow page header.
+    // pgno (offset 0..8)
+    buf[0..8].copy_from_slice(&start_pgno.to_le_bytes());
+    // pad (offset 8..10) = 0
+    // flags (offset 10..12) = P_OVERFLOW | P_DIRTY
+    let flags = PageFlags::OVERFLOW | PageFlags::DIRTY;
+    buf[10..12].copy_from_slice(&flags.bits().to_le_bytes());
+    // overflow_pages count (offset 12..16) as u32
+    buf[12..16].copy_from_slice(&(num_pages as u32).to_le_bytes());
+
+    // Write data starting at PAGE_HEADER_SIZE.
+    buf[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + data.len()].copy_from_slice(data);
+
+    // Store the entire overflow chain as a single buffer at start_pgno.
+    txn.dirty.insert(start_pgno, big_buf);
+
+    Ok((start_pgno, num_pages))
+}
+
+/// If the node at `idx` on the leaf page `leaf_pgno` has the `BIGDATA` flag,
+/// free its overflow pages and update the database overflow page counter.
+fn free_overflow_if_bigdata(
+    txn: &mut RwTransaction<'_>,
+    dbi: u32,
+    leaf_pgno: u64,
+    idx: usize,
+    page_size: usize,
+) -> Result<()> {
+    let leaf_buf = txn.dirty.find(leaf_pgno).ok_or(Error::Corrupted)?;
+    let leaf_page = leaf_buf.as_page();
+    let node = leaf_page.node(idx);
+
+    if !node.is_bigdata() {
+        return Ok(());
+    }
+
+    let overflow_pgno = node.overflow_pgno();
+
+    // Read the overflow page to get the page count.
+    let ovf_ptr = txn.get_page(overflow_pgno)?;
+    let ovf_slice = unsafe { std::slice::from_raw_parts(ovf_ptr, page_size) };
+    let ovf_page = Page::from_raw(ovf_slice);
+    let num_pages = ovf_page.overflow_pages() as u64;
+
+    // Free all overflow pages.
+    for pg in overflow_pgno..overflow_pgno + num_pages {
+        txn.free_pgs.push(pg);
+    }
+    // Remove from dirty list (stored as single buffer at start_pgno).
+    txn.dirty.remove(overflow_pgno);
+
+    // Update overflow page counter.
+    let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+    db_mut.overflow_pages = db_mut.overflow_pages.saturating_sub(num_pages);
+
+    Ok(())
+}
+
+/// A leaf entry for bigdata splits that preserves the actual data size.
+struct BigdataLeafEntry {
+    key: Vec<u8>,
+    /// Inline data (8-byte pgno for BIGDATA, or actual data for normal nodes).
+    data: Vec<u8>,
+    flags: NodeFlags,
+    /// For BIGDATA nodes, the actual data size to store in the node header.
+    actual_data_size: Option<u32>,
+}
+
+/// Split a full leaf page and insert a new bigdata entry, propagating the
+/// separator key up through the tree.
+#[allow(clippy::too_many_arguments)]
+fn split_and_insert_bigdata(
+    txn: &mut RwTransaction<'_>,
+    dbi: u32,
+    path: &TreePath,
+    key: &[u8],
+    pgno_data: &[u8],
+    actual_data_size: u32,
+    insert_idx: usize,
+    _cmp: &CmpFn,
+) -> Result<()> {
+    let page_size = txn.env.page_size;
+    let leaf_level = path.len() - 1;
+    let leaf_pgno = path[leaf_level].pgno;
+
+    // Collect all existing entries from the full leaf page.
+    let leaf_buf = txn.dirty.find(leaf_pgno).ok_or(Error::Corrupted)?;
+    let leaf_page = leaf_buf.as_page();
+    let nkeys = leaf_page.num_keys();
+
+    let mut entries: Vec<BigdataLeafEntry> = Vec::with_capacity(nkeys + 1);
+    for i in 0..nkeys {
+        let node = leaf_page.node(i);
+        let ads = if node.is_bigdata() {
+            Some(node.data_size())
+        } else {
+            None
+        };
+        entries.push(BigdataLeafEntry {
+            key: node.key().to_vec(),
+            data: node.node_data().to_vec(),
+            flags: node.flags(),
+            actual_data_size: ads,
+        });
+    }
+
+    // Insert the new bigdata entry at the correct position.
+    entries.insert(
+        insert_idx,
+        BigdataLeafEntry {
+            key: key.to_vec(),
+            data: pgno_data.to_vec(),
+            flags: NodeFlags::BIGDATA,
+            actual_data_size: Some(actual_data_size),
+        },
+    );
+
+    let total = entries.len();
+    let split_idx = total / 2;
+
+    // Allocate right sibling leaf.
+    let (right_pgno, mut right_buf) = txn.page_alloc()?;
+    init_page(
+        right_buf.as_mut_slice(),
+        right_pgno,
+        PageFlags::LEAF | PageFlags::DIRTY,
+        page_size,
+    );
+
+    // Reinitialize the left leaf page.
+    let left_pgno = leaf_pgno;
+    let left_buf = txn.dirty.find_mut(left_pgno).ok_or(Error::Corrupted)?;
+    init_page(
+        left_buf.as_mut_slice(),
+        left_pgno,
+        PageFlags::LEAF | PageFlags::DIRTY,
+        page_size,
+    );
+
+    // Helper closure to add a bigdata-aware entry.
+    fn add_entry(page: &mut [u8], page_size: usize, i: usize, e: &BigdataLeafEntry) -> Result<()> {
+        if let Some(ads) = e.actual_data_size {
+            // BIGDATA entry: data is the 8-byte overflow pgno
+            let mut pgno_bytes = [0u8; 8];
+            pgno_bytes.copy_from_slice(&e.data[..8]);
+            let overflow_pgno = u64::from_le_bytes(pgno_bytes);
+            node_add_bigdata(page, page_size, i, &e.key, overflow_pgno, ads)
+        } else {
+            node_add(page, page_size, i, &e.key, &e.data, 0, e.flags)
+        }
+    }
+
+    // Populate the left page.
+    for (i, entry) in entries[..split_idx].iter().enumerate() {
+        add_entry(left_buf.as_mut_slice(), page_size, i, entry)?;
+    }
+
+    // Populate the right page.
+    for (i, entry) in entries[split_idx..].iter().enumerate() {
+        add_entry(right_buf.as_mut_slice(), page_size, i, entry)?;
+    }
+
+    let sep_key = entries[split_idx].key.clone();
+
+    txn.dirty.insert(right_pgno, right_buf);
+
+    let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+    db_mut.leaf_pages += 1;
+
+    insert_separator(txn, dbi, path, leaf_level, &sep_key, left_pgno, right_pgno)?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,6 +1627,239 @@ mod tests {
                     .unwrap_or_else(|e| panic!("get {key}: {e}"));
                 assert_eq!(got, val.as_bytes(), "mismatch for {key}");
             }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Overflow page tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_should_insert_and_read_overflow_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = test_env(dir.path());
+
+        // Insert a value larger than page size (8 KB on 4096-byte pages).
+        let big_val = vec![0xAB_u8; 32768];
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI, b"big-key", &big_val, WriteFlags::empty())
+                .expect("put overflow value");
+            txn.commit().expect("commit");
+        }
+
+        // Read it back via read-only transaction.
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let got = txn.get(MAIN_DBI, b"big-key").expect("get overflow value");
+            assert_eq!(got.len(), 32768);
+            assert!(got.iter().all(|&b| b == 0xAB));
+        }
+    }
+
+    #[test]
+    fn test_should_read_overflow_within_write_txn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = test_env(dir.path());
+
+        let big_val = vec![0xCD_u8; 32768];
+        let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+        txn.put(MAIN_DBI, b"within-txn", &big_val, WriteFlags::empty())
+            .expect("put");
+
+        // Read within the same write transaction.
+        let got = txn.get(MAIN_DBI, b"within-txn").expect("get within txn");
+        assert_eq!(got.len(), 32768);
+        assert!(got.iter().all(|&b| b == 0xCD));
+
+        txn.commit().expect("commit");
+    }
+
+    #[test]
+    fn test_should_update_overflow_with_larger_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = test_env(dir.path());
+
+        // Insert initial overflow value.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let val = vec![0x11_u8; 32768];
+            txn.put(MAIN_DBI, b"upd-key", &val, WriteFlags::empty())
+                .expect("put initial");
+            txn.commit().expect("commit");
+        }
+
+        // Update with a larger overflow value.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let val = vec![0x22_u8; 65536];
+            txn.put(MAIN_DBI, b"upd-key", &val, WriteFlags::empty())
+                .expect("put larger");
+            txn.commit().expect("commit");
+        }
+
+        // Verify the updated value.
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let got = txn.get(MAIN_DBI, b"upd-key").expect("get updated");
+            assert_eq!(got.len(), 65536);
+            assert!(got.iter().all(|&b| b == 0x22));
+        }
+    }
+
+    #[test]
+    fn test_should_update_overflow_to_inline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = test_env(dir.path());
+
+        // Insert overflow value.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let val = vec![0x33_u8; 32768];
+            txn.put(MAIN_DBI, b"shrink-key", &val, WriteFlags::empty())
+                .expect("put overflow");
+            txn.commit().expect("commit");
+        }
+
+        // Update with a small inline value.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI, b"shrink-key", b"small", WriteFlags::empty())
+                .expect("put inline");
+            txn.commit().expect("commit");
+        }
+
+        // Verify the inline value.
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let got = txn.get(MAIN_DBI, b"shrink-key").expect("get inline");
+            assert_eq!(got, b"small");
+        }
+    }
+
+    #[test]
+    fn test_should_delete_overflow_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = test_env(dir.path());
+
+        // Insert overflow value.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let val = vec![0x44_u8; 32768];
+            txn.put(MAIN_DBI, b"del-key", &val, WriteFlags::empty())
+                .expect("put overflow");
+            txn.commit().expect("commit");
+        }
+
+        // Delete it.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.del(MAIN_DBI, b"del-key").expect("del overflow");
+            txn.commit().expect("commit");
+        }
+
+        // Verify deleted.
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let result = txn.get(MAIN_DBI, b"del-key");
+            assert!(
+                matches!(result, Err(crate::error::Error::NotFound)),
+                "expected NotFound, got {result:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_insert_multiple_overflow_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = test_env(dir.path());
+
+        let sizes = [32768usize, 49152, 65536, 131072];
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for &size in &sizes {
+                let key = format!("multi-{size}");
+                let val = vec![(size & 0xFF) as u8; size];
+                txn.put(MAIN_DBI, key.as_bytes(), &val, WriteFlags::empty())
+                    .expect("put");
+            }
+            txn.commit().expect("commit");
+        }
+
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            for &size in &sizes {
+                let key = format!("multi-{size}");
+                let got = txn.get(MAIN_DBI, key.as_bytes()).expect("get");
+                assert_eq!(got.len(), size, "size mismatch for {key}");
+                assert!(
+                    got.iter().all(|&b| b == (size & 0xFF) as u8),
+                    "content mismatch for {key}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_should_mix_inline_and_overflow_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = test_env(dir.path());
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            // Insert mix of inline and overflow values.
+            for i in 0..100u32 {
+                let key = format!("mix-{i:04}");
+                let size = if i % 5 == 0 { 32768 } else { 100 };
+                let val = vec![(i & 0xFF) as u8; size];
+                txn.put(MAIN_DBI, key.as_bytes(), &val, WriteFlags::empty())
+                    .expect("put");
+            }
+            txn.commit().expect("commit");
+        }
+
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            for i in 0..100u32 {
+                let key = format!("mix-{i:04}");
+                let expected_size = if i % 5 == 0 { 32768 } else { 100 };
+                let got = txn.get(MAIN_DBI, key.as_bytes()).expect("get");
+                assert_eq!(got.len(), expected_size, "size mismatch for {key}");
+                assert!(
+                    got.iter().all(|&b| b == (i & 0xFF) as u8),
+                    "content mismatch for {key}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_should_track_overflow_pages_in_stats() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = test_env(dir.path());
+
+        // Insert a value guaranteed to exceed node_max (which depends on
+        // the OS page size). Use a large enough value to trigger overflow
+        // on all platforms.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let node_max = txn.env.node_max;
+            // Ensure the value exceeds node_max.
+            let val_size = node_max + 100;
+            let val = vec![0xEE_u8; val_size];
+
+            txn.put(MAIN_DBI, b"stat-key", &val, WriteFlags::empty())
+                .expect("put");
+
+            // Check the overflow_pages counter within the transaction.
+            let db = txn.dbs[MAIN_DBI as usize];
+            assert!(
+                db.overflow_pages > 0,
+                "overflow_pages should be > 0 within txn, got {}",
+                db.overflow_pages,
+            );
+            txn.commit().expect("commit");
         }
     }
 }

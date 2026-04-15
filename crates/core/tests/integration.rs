@@ -736,3 +736,239 @@ fn test_e2e_stress_5000_keys() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Free Page Reuse
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_e2e_free_page_reuse() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = Environment::builder()
+        .map_size(10 * 1024 * 1024)
+        .open(dir.path())
+        .expect("open env");
+
+    // Insert 500 keys across multiple transactions.
+    for batch in 0..5u32 {
+        let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+        for i in 0..100u32 {
+            let idx = batch * 100 + i;
+            let key = format!("free-{idx:06}");
+            let val = format!("data-{idx:06}");
+            txn.put(
+                MAIN_DBI,
+                key.as_bytes(),
+                val.as_bytes(),
+                WriteFlags::empty(),
+            )
+            .unwrap_or_else(|e| panic!("put {key}: {e}"));
+        }
+        txn.commit().expect("commit");
+    }
+
+    let pgno_after_initial = env.info().last_pgno;
+
+    // Delete all 500 keys in a single transaction.
+    {
+        let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+        for idx in 0..500u32 {
+            let key = format!("free-{idx:06}");
+            txn.del(MAIN_DBI, key.as_bytes())
+                .unwrap_or_else(|e| panic!("del {key}: {e}"));
+        }
+        txn.commit().expect("commit");
+    }
+
+    // Insert 500 new keys — should reuse freed pages.
+    for batch in 0..5u32 {
+        let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+        for i in 0..100u32 {
+            let idx = batch * 100 + i;
+            let key = format!("reused-{idx:06}");
+            let val = format!("newdata-{idx:06}");
+            txn.put(
+                MAIN_DBI,
+                key.as_bytes(),
+                val.as_bytes(),
+                WriteFlags::empty(),
+            )
+            .unwrap_or_else(|e| panic!("put {key}: {e}"));
+        }
+        txn.commit().expect("commit");
+    }
+
+    let pgno_after_reinsert = env.info().last_pgno;
+
+    // With free page reuse, the file should have grown significantly less
+    // than without reuse. Without reuse, after_reinsert would be roughly
+    // initial * 2 + overhead. With reuse, some pages are recycled so the
+    // growth is bounded. We allow up to 3x the initial page count to
+    // account for freelist tree overhead and COW copies across the
+    // multiple insert/delete transactions.
+    assert!(
+        pgno_after_reinsert < pgno_after_initial * 3,
+        "expected page reuse to limit growth: initial={pgno_after_initial}, \
+         after_reinsert={pgno_after_reinsert}",
+    );
+
+    // Verify all new data is readable.
+    {
+        let txn = env.begin_ro_txn().expect("begin_ro_txn");
+        for idx in 0..500u32 {
+            let key = format!("reused-{idx:06}");
+            let val = format!("newdata-{idx:06}");
+            let got = txn
+                .get(MAIN_DBI, key.as_bytes())
+                .unwrap_or_else(|e| panic!("get {key}: {e}"));
+            assert_eq!(got, val.as_bytes(), "mismatch for {key}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Overflow Pages (Large Values)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_e2e_overflow_large_values() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = Environment::builder()
+        .map_size(64 * 1024 * 1024) // 64 MB for large values
+        .open(dir.path())
+        .expect("open env");
+
+    let sizes = [1024usize, 4096, 32768, 65536, 131072];
+
+    // Insert values of various sizes (some inline, some overflow).
+    {
+        let mut txn = env.begin_rw_txn().expect("rw txn");
+        for &size in &sizes {
+            let key = format!("large-{size:06}");
+            let val = vec![(size % 251) as u8; size];
+            txn.put(MAIN_DBI, key.as_bytes(), &val, WriteFlags::empty())
+                .expect("put large value");
+        }
+        txn.commit().expect("commit");
+    }
+
+    // Read them all back.
+    {
+        let txn = env.begin_ro_txn().expect("ro txn");
+        for &size in &sizes {
+            let key = format!("large-{size:06}");
+            let val = txn.get(MAIN_DBI, key.as_bytes()).expect("get");
+            assert_eq!(val.len(), size, "size mismatch for {key}");
+            assert!(
+                val.iter().all(|&b| b == (size % 251) as u8),
+                "content mismatch for {key}",
+            );
+        }
+    }
+
+    // Delete them all.
+    {
+        let mut txn = env.begin_rw_txn().expect("rw txn");
+        for &size in &sizes {
+            let key = format!("large-{size:06}");
+            txn.del(MAIN_DBI, key.as_bytes()).expect("del");
+        }
+        txn.commit().expect("commit");
+    }
+
+    // Verify empty database.
+    {
+        let txn = env.begin_ro_txn().expect("ro txn");
+        for &size in &sizes {
+            let key = format!("large-{size:06}");
+            assert!(
+                matches!(txn.get(MAIN_DBI, key.as_bytes()), Err(Error::NotFound)),
+                "key {key} should be deleted",
+            );
+        }
+    }
+}
+
+#[test]
+fn test_e2e_overflow_persist_across_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Write large values.
+    {
+        let env = Environment::builder()
+            .map_size(64 * 1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+        let mut txn = env.begin_rw_txn().expect("rw txn");
+        let val = vec![0xBB_u8; 32768];
+        txn.put(MAIN_DBI, b"persist-big", &val, WriteFlags::empty())
+            .expect("put");
+        txn.commit().expect("commit");
+    }
+
+    // Reopen and verify.
+    {
+        let env = Environment::builder()
+            .map_size(64 * 1024 * 1024)
+            .open(dir.path())
+            .expect("reopen");
+        let txn = env.begin_ro_txn().expect("ro txn");
+        let got = txn.get(MAIN_DBI, b"persist-big").expect("get");
+        assert_eq!(got.len(), 32768);
+        assert!(got.iter().all(|&b| b == 0xBB));
+    }
+}
+
+#[test]
+fn test_e2e_overflow_update_and_cursor_iteration() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = Environment::builder()
+        .map_size(64 * 1024 * 1024)
+        .open(dir.path())
+        .expect("open");
+
+    // Insert mix of inline and overflow values.
+    {
+        let mut txn = env.begin_rw_txn().expect("rw txn");
+        for i in 0..20u32 {
+            let key = format!("cursor-{i:03}");
+            let size = if i % 3 == 0 { 32768 } else { 50 };
+            let val = vec![(i & 0xFF) as u8; size];
+            txn.put(MAIN_DBI, key.as_bytes(), &val, WriteFlags::empty())
+                .expect("put");
+        }
+        txn.commit().expect("commit");
+    }
+
+    // Iterate using cursor and verify sorted order and correct values.
+    {
+        let txn = env.begin_ro_txn().expect("ro txn");
+        let mut cursor = txn.open_cursor(MAIN_DBI).expect("cursor");
+        let mut count = 0;
+        let mut prev_key: Option<Vec<u8>> = None;
+
+        for result in cursor.iter() {
+            let (key, val) = result.expect("cursor iter");
+            if let Some(ref pk) = prev_key {
+                assert!(key > pk.as_slice(), "keys out of order");
+            }
+            prev_key = Some(key.to_vec());
+
+            // Parse the key to verify the value.
+            let key_str = std::str::from_utf8(key).expect("utf8");
+            let i: u32 = key_str
+                .strip_prefix("cursor-")
+                .expect("prefix")
+                .parse()
+                .expect("parse");
+            let expected_size = if i % 3 == 0 { 32768 } else { 50 };
+            assert_eq!(val.len(), expected_size, "size mismatch for {key_str}");
+            assert!(
+                val.iter().all(|&b| b == (i & 0xFF) as u8),
+                "content mismatch for {key_str}",
+            );
+            count += 1;
+        }
+        assert_eq!(count, 20, "expected 20 entries");
+    }
+}
