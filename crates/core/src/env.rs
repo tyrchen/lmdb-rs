@@ -20,7 +20,10 @@ use std::{
     io::Write,
     mem,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
 };
 
 use memmap2::{MmapOptions, MmapRaw};
@@ -138,6 +141,98 @@ impl Default for EnvironmentBuilder {
 }
 
 // ---------------------------------------------------------------------------
+// ReaderTable — tracks active read transaction snapshots
+// ---------------------------------------------------------------------------
+
+/// Tracks active reader transaction IDs for correct page reclamation.
+///
+/// Each read transaction registers its snapshot txnid. The writer scans
+/// the table to find the oldest active reader, and only reclaims pages
+/// freed by transactions older than that.
+///
+/// The sentinel value `u64::MAX` indicates a free (unused) slot.
+pub(crate) struct ReaderTable {
+    /// Slots for reader txnids. `u64::MAX` means the slot is free.
+    slots: Vec<AtomicU64>,
+}
+
+/// Sentinel value indicating a free reader slot.
+const READER_SLOT_FREE: u64 = u64::MAX;
+
+impl ReaderTable {
+    /// Create a new reader table with `max_readers` slots, all initially free.
+    pub(crate) fn new(max_readers: u32) -> Self {
+        let mut slots = Vec::with_capacity(max_readers as usize);
+        for _ in 0..max_readers {
+            slots.push(AtomicU64::new(READER_SLOT_FREE));
+        }
+        Self { slots }
+    }
+
+    /// Acquire a reader slot and set the txnid.
+    ///
+    /// Returns the slot index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReadersFull`] if no slots are available.
+    pub(crate) fn acquire(&self, txnid: u64) -> Result<usize> {
+        for (i, slot) in self.slots.iter().enumerate() {
+            if slot
+                .compare_exchange(
+                    READER_SLOT_FREE,
+                    txnid,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Relaxed,
+                )
+                .is_ok()
+            {
+                return Ok(i);
+            }
+        }
+        Err(Error::ReadersFull)
+    }
+
+    /// Release a reader slot, marking it as free.
+    pub(crate) fn release(&self, slot_idx: usize) {
+        if slot_idx < self.slots.len() {
+            self.slots[slot_idx].store(READER_SLOT_FREE, AtomicOrdering::Release);
+        }
+    }
+
+    /// Find the oldest (minimum) active reader txnid.
+    ///
+    /// Returns `u64::MAX` if no readers are active.
+    pub(crate) fn find_oldest(&self) -> u64 {
+        let mut oldest = READER_SLOT_FREE;
+        for slot in &self.slots {
+            let txnid = slot.load(AtomicOrdering::Acquire);
+            if txnid < oldest {
+                oldest = txnid;
+            }
+        }
+        oldest
+    }
+
+    /// Count the number of active readers.
+    pub(crate) fn active_count(&self) -> u32 {
+        self.slots
+            .iter()
+            .filter(|s| s.load(AtomicOrdering::Relaxed) != READER_SLOT_FREE)
+            .count() as u32
+    }
+}
+
+impl std::fmt::Debug for ReaderTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReaderTable")
+            .field("total_slots", &self.slots.len())
+            .field("active_count", &self.active_count())
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Environment / EnvironmentInner
 // ---------------------------------------------------------------------------
 
@@ -187,6 +282,8 @@ pub(crate) struct EnvironmentInner {
     pub(crate) db_flags: RwLock<Vec<u16>>,
     /// Writer mutex — only one write transaction at a time.
     pub(crate) write_mutex: Mutex<()>,
+    /// In-process reader table tracking active read transaction snapshots.
+    pub(crate) reader_table: ReaderTable,
 }
 
 // SAFETY: The raw mmap pointer is only accessed through methods that uphold
@@ -499,6 +596,7 @@ impl Environment {
             db_names: RwLock::new(names_vec),
             db_flags: RwLock::new(flags_vec),
             write_mutex: Mutex::new(()),
+            reader_table: ReaderTable::new(config.max_readers),
         };
 
         Ok(Self {
@@ -555,7 +653,7 @@ impl Environment {
             last_pgno: meta.last_pgno,
             last_txnid: meta.txnid,
             max_readers: self.inner.max_readers,
-            num_readers: 0,
+            num_readers: self.inner.reader_table.active_count(),
         }
     }
 

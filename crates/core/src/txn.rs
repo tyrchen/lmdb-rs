@@ -22,21 +22,38 @@ use crate::{
 /// Data returned from [`get`](Self::get) or cursor operations points directly
 /// into the memory-mapped file and is valid for the lifetime of the
 /// transaction.
+///
+/// On creation, a reader slot is acquired from the environment's reader table.
+/// The slot is released when the transaction is dropped, allowing the writer
+/// to reclaim pages freed after this snapshot's txnid.
 pub struct RoTransaction<'env> {
     pub(crate) env: &'env EnvironmentInner,
     txnid: u64,
     /// Snapshot of database metadata for all open databases.
     dbs: Vec<DbStat>,
+    /// Reader table slot index, released on drop.
+    reader_slot: Option<usize>,
 }
 
 impl<'env> RoTransaction<'env> {
     /// Create a new read-only transaction.
+    ///
+    /// Acquires a reader slot in the environment's reader table, registering
+    /// this transaction's snapshot txnid so the writer knows not to reclaim
+    /// pages that this transaction may still reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReadersFull`] if all reader slots are occupied.
     pub(crate) fn new(env: &'env EnvironmentInner) -> Result<Self> {
         let meta = env.meta();
+        let txnid = meta.txnid;
+        let slot = env.reader_table.acquire(txnid)?;
         Ok(Self {
             env,
-            txnid: meta.txnid,
+            txnid,
             dbs: vec![meta.dbs[0], meta.dbs[1]],
+            reader_slot: Some(slot),
         })
     }
 
@@ -232,6 +249,14 @@ impl<'env> RoTransaction<'env> {
     /// Resolve a database handle to its metadata.
     fn db(&self, dbi: u32) -> Result<&DbStat> {
         self.dbs.get(dbi as usize).ok_or(Error::BadDbi)
+    }
+}
+
+impl Drop for RoTransaction<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.reader_slot.take() {
+            self.env.reader_table.release(slot);
+        }
     }
 }
 

@@ -14,7 +14,7 @@ use crate::{
     node::{init_page, leaf_size, node_add, node_add_bigdata, node_del},
     page::{Page, even},
     types::*,
-    write::{PageBuf, RwTransaction},
+    write::{PageBuf, RwTransaction, db_stat_to_bytes},
 };
 
 // ---------------------------------------------------------------------------
@@ -1454,10 +1454,46 @@ fn dupsort_put(
 
         // Check if sub-page fits in the node.
         if NODE_HEADER_SIZE + node_key.len() + sub_page.len() > node_max {
-            // Too large for a node, but this is unlikely for 2 values.
-            // Fall back: just store directly. In practice this would promote
-            // to a sub-DB but for correctness with small values, error out.
-            return Err(Error::BadValSize);
+            // Sub-page too large even for 2 values, promote directly to sub-DB.
+            let sub_db = promote_to_sub_db(txn, &sorted, dupfixed)?;
+            let db_bytes = db_stat_to_bytes(&sub_db);
+
+            let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+            node_del(buf.as_mut_slice(), page_size, insert_idx);
+
+            let nf = NodeFlags::DUPDATA | NodeFlags::SUBDATA;
+            let add_result = node_add(
+                buf.as_mut_slice(),
+                page_size,
+                insert_idx,
+                &node_key,
+                &db_bytes,
+                0,
+                nf,
+            );
+
+            match add_result {
+                Ok(()) => {}
+                Err(Error::PageFull) => {
+                    split_and_insert(
+                        txn,
+                        dbi,
+                        path,
+                        &node_key,
+                        &db_bytes,
+                        nf,
+                        insert_idx,
+                        &|a: &[u8], b: &[u8]| a.cmp(b),
+                    )?;
+                }
+                Err(e) => return Err(e),
+            }
+
+            let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+            db_mut.root = path[0].pgno;
+            db_mut.entries += 1;
+            txn.db_dirty[dbi as usize] = true;
+            return Ok(());
         }
 
         // Delete old node and insert new one with F_DUPDATA.
@@ -1499,7 +1535,13 @@ fn dupsort_put(
         return Ok(());
     }
 
-    // Node already has F_DUPDATA: insert into existing sub-page.
+    // Node already has F_DUPDATA: check if it's a sub-database or sub-page.
+    if node.flags().contains(NodeFlags::SUBDATA) {
+        // Insert into existing sub-database.
+        return dupsort_put_into_sub_db(txn, dbi, path, leaf_pgno, insert_idx, data, flags, dcmp);
+    }
+
+    // Node has sub-page: insert into existing sub-page.
     let sub_page_data = node.node_data().to_vec();
     let node_key = node.key().to_vec();
 
@@ -1544,9 +1586,45 @@ fn dupsort_put(
     // Check if the new sub-page fits in a node.
     if NODE_HEADER_SIZE + node_key.len() + new_sub_page.len() > node_max {
         // Sub-page too large, promote to sub-database.
-        // For now, return an error since sub-DB promotion is complex.
-        // This limits DUPSORT to cases where dups fit in a sub-page.
-        return Err(Error::BadValSize);
+        let sub_db = promote_to_sub_db(txn, &vals, dupfixed)?;
+        let db_bytes = db_stat_to_bytes(&sub_db);
+
+        let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        node_del(buf.as_mut_slice(), page_size, insert_idx);
+
+        let nf = NodeFlags::DUPDATA | NodeFlags::SUBDATA;
+        let add_result = node_add(
+            buf.as_mut_slice(),
+            page_size,
+            insert_idx,
+            &node_key,
+            &db_bytes,
+            0,
+            nf,
+        );
+
+        match add_result {
+            Ok(()) => {}
+            Err(Error::PageFull) => {
+                split_and_insert(
+                    txn,
+                    dbi,
+                    path,
+                    &node_key,
+                    &db_bytes,
+                    nf,
+                    insert_idx,
+                    &|a: &[u8], b: &[u8]| a.cmp(b),
+                )?;
+            }
+            Err(e) => return Err(e),
+        }
+
+        let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+        db_mut.root = path[0].pgno;
+        db_mut.entries += 1;
+        txn.db_dirty[dbi as usize] = true;
+        return Ok(());
     }
 
     // Delete old node and insert updated one.
@@ -1587,6 +1665,642 @@ fn dupsort_put(
     Ok(())
 }
 
+/// Promote a set of sorted duplicate values into a sub-database B+ tree.
+///
+/// Creates a new root leaf page for the sub-DB and inserts all values
+/// into it. Each value becomes a "key" in the sub-DB with empty data.
+/// Returns the `DbStat` describing the new sub-database.
+///
+/// # Errors
+///
+/// Returns [`Error::MapFull`] if pages cannot be allocated.
+fn promote_to_sub_db(
+    txn: &mut RwTransaction<'_>,
+    sorted_vals: &[Vec<u8>],
+    dupfixed: bool,
+) -> Result<DbStat> {
+    let page_size = txn.env.page_size;
+
+    // Create root page for sub-DB.
+    let (root_pgno, mut root_buf) = txn.page_alloc()?;
+    init_page(
+        root_buf.as_mut_slice(),
+        root_pgno,
+        PageFlags::LEAF | PageFlags::DIRTY,
+        page_size,
+    );
+
+    let mut sub_db = DbStat {
+        pad: 0,
+        flags: if dupfixed {
+            DatabaseFlags::DUP_FIXED.bits() as u16
+        } else {
+            0
+        },
+        depth: 1,
+        branch_pages: 0,
+        leaf_pages: 1,
+        overflow_pages: 0,
+        entries: 0,
+        root: root_pgno,
+    };
+
+    // Try to fit all values into the root page. If it overflows,
+    // we use cursor_put to handle splitting.
+    let mut need_cursor_insert: Vec<Vec<u8>> = Vec::new();
+    for val in sorted_vals {
+        let result = node_add(
+            root_buf.as_mut_slice(),
+            page_size,
+            sub_db.entries as usize,
+            val,
+            &[],
+            0,
+            NodeFlags::empty(),
+        );
+        match result {
+            Ok(()) => sub_db.entries += 1,
+            Err(Error::PageFull) => {
+                // Remaining values need cursor-based insertion with splitting.
+                need_cursor_insert.push(val.clone());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    txn.dirty.insert(root_pgno, root_buf);
+
+    // If some values didn't fit, insert them via the full B+ tree machinery.
+    if !need_cursor_insert.is_empty() {
+        for val in &need_cursor_insert {
+            insert_into_sub_db_tree(txn, &mut sub_db, val)?;
+        }
+    }
+
+    Ok(sub_db)
+}
+
+/// Insert a single value into a sub-database B+ tree.
+///
+/// The sub-DB stores each duplicate value as a "key" with empty data.
+/// This function uses the existing B+ tree walk/insert/split machinery
+/// to insert into the sub-DB.
+fn insert_into_sub_db_tree(
+    txn: &mut RwTransaction<'_>,
+    sub_db: &mut DbStat,
+    val: &[u8],
+) -> Result<()> {
+    let page_size = txn.env.page_size;
+    let cmp: Box<CmpFn> = Box::new(|a: &[u8], b: &[u8]| a.cmp(b));
+
+    if sub_db.root == P_INVALID {
+        // Empty sub-DB: create a new root leaf.
+        let (root_pgno, mut root_buf) = txn.page_alloc()?;
+        init_page(
+            root_buf.as_mut_slice(),
+            root_pgno,
+            PageFlags::LEAF | PageFlags::DIRTY,
+            page_size,
+        );
+        node_add(
+            root_buf.as_mut_slice(),
+            page_size,
+            0,
+            val,
+            &[],
+            0,
+            NodeFlags::empty(),
+        )?;
+        txn.dirty.insert(root_pgno, root_buf);
+        sub_db.root = root_pgno;
+        sub_db.depth = 1;
+        sub_db.leaf_pages = 1;
+        sub_db.entries = 1;
+        return Ok(());
+    }
+
+    // Walk the sub-DB tree from root to leaf, COW-ing each page.
+    let (path, leaf_pgno) = walk_and_touch(txn, sub_db.root, val, &*cmp)?;
+
+    // Find insertion point.
+    let leaf_buf = txn.dirty.find(leaf_pgno).ok_or(Error::Corrupted)?;
+    let leaf_page = leaf_buf.as_page();
+    let (insert_idx, exact) = page_node_search(&leaf_page, val, &*cmp);
+
+    if exact && insert_idx < leaf_page.num_keys() {
+        // Value already exists, nothing to do.
+        return Ok(());
+    }
+
+    // Attempt inline insertion.
+    let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+    let add_result = node_add(
+        buf.as_mut_slice(),
+        page_size,
+        insert_idx,
+        val,
+        &[],
+        0,
+        NodeFlags::empty(),
+    );
+
+    match add_result {
+        Ok(()) => {
+            sub_db.root = path[0].pgno;
+            sub_db.entries += 1;
+        }
+        Err(Error::PageFull) => {
+            split_and_insert_sub_db(txn, sub_db, &path, val, insert_idx, &*cmp)?;
+            sub_db.entries += 1;
+        }
+        Err(e) => return Err(e),
+    }
+
+    Ok(())
+}
+
+/// Split a full leaf page in a sub-database and insert the new entry.
+///
+/// This is similar to `split_and_insert` but updates the sub-DB stats
+/// instead of `txn.dbs[dbi]`.
+fn split_and_insert_sub_db(
+    txn: &mut RwTransaction<'_>,
+    sub_db: &mut DbStat,
+    path: &TreePath,
+    val: &[u8],
+    insert_idx: usize,
+    _cmp: &CmpFn,
+) -> Result<()> {
+    let page_size = txn.env.page_size;
+    let leaf_level = path.len() - 1;
+    let leaf_pgno = path[leaf_level].pgno;
+
+    // Collect all existing entries from the full leaf page.
+    let leaf_buf = txn.dirty.find(leaf_pgno).ok_or(Error::Corrupted)?;
+    let leaf_page = leaf_buf.as_page();
+    let nkeys = leaf_page.num_keys();
+
+    let mut entries: Vec<LeafEntry> = Vec::with_capacity(nkeys + 1);
+    for i in 0..nkeys {
+        let node = leaf_page.node(i);
+        entries.push(LeafEntry {
+            key: node.key().to_vec(),
+            data: node.node_data().to_vec(),
+            flags: node.flags(),
+            actual_data_size: None,
+        });
+    }
+
+    // Insert the new entry.
+    entries.insert(
+        insert_idx,
+        LeafEntry {
+            key: val.to_vec(),
+            data: Vec::new(),
+            flags: NodeFlags::empty(),
+            actual_data_size: None,
+        },
+    );
+
+    let total = entries.len();
+    let split_idx = total / 2;
+
+    // Allocate right sibling leaf.
+    let (right_pgno, mut right_buf) = txn.page_alloc()?;
+    init_page(
+        right_buf.as_mut_slice(),
+        right_pgno,
+        PageFlags::LEAF | PageFlags::DIRTY,
+        page_size,
+    );
+
+    // Reinitialize the left leaf page.
+    let left_pgno = leaf_pgno;
+    let left_buf = txn.dirty.find_mut(left_pgno).ok_or(Error::Corrupted)?;
+    init_page(
+        left_buf.as_mut_slice(),
+        left_pgno,
+        PageFlags::LEAF | PageFlags::DIRTY,
+        page_size,
+    );
+
+    for (i, entry) in entries[..split_idx].iter().enumerate() {
+        add_leaf_entry(left_buf.as_mut_slice(), page_size, i, entry)?;
+    }
+
+    for (i, entry) in entries[split_idx..].iter().enumerate() {
+        add_leaf_entry(right_buf.as_mut_slice(), page_size, i, entry)?;
+    }
+
+    let sep_key = entries[split_idx].key.clone();
+    txn.dirty.insert(right_pgno, right_buf);
+
+    sub_db.leaf_pages += 1;
+
+    // Propagate separator up to the parent.
+    insert_separator_sub_db(
+        txn, sub_db, path, leaf_level, &sep_key, left_pgno, right_pgno,
+    )?;
+
+    Ok(())
+}
+
+/// Insert a separator key into the parent branch for a sub-database split.
+///
+/// Creates a new root if the split page was the root.
+fn insert_separator_sub_db(
+    txn: &mut RwTransaction<'_>,
+    sub_db: &mut DbStat,
+    path: &TreePath,
+    split_level: usize,
+    sep_key: &[u8],
+    left_pgno: u64,
+    right_pgno: u64,
+) -> Result<()> {
+    let page_size = txn.env.page_size;
+
+    if split_level == 0 {
+        // The split page was the root: create a new root branch.
+        let (new_root_pgno, mut new_root_buf) = txn.page_alloc()?;
+        init_page(
+            new_root_buf.as_mut_slice(),
+            new_root_pgno,
+            PageFlags::BRANCH | PageFlags::DIRTY,
+            page_size,
+        );
+
+        node_add(
+            new_root_buf.as_mut_slice(),
+            page_size,
+            0,
+            &[],
+            &[],
+            left_pgno,
+            NodeFlags::empty(),
+        )?;
+
+        node_add(
+            new_root_buf.as_mut_slice(),
+            page_size,
+            1,
+            sep_key,
+            &[],
+            right_pgno,
+            NodeFlags::empty(),
+        )?;
+
+        txn.dirty.insert(new_root_pgno, new_root_buf);
+
+        sub_db.root = new_root_pgno;
+        sub_db.depth += 1;
+        sub_db.branch_pages += 1;
+
+        return Ok(());
+    }
+
+    // Insert into existing parent branch.
+    let parent_level = split_level - 1;
+    let parent_pgno = path[parent_level].pgno;
+    let parent_child_idx = path[parent_level].idx;
+    let insert_idx = parent_child_idx + 1;
+
+    let buf = txn.dirty.find_mut(parent_pgno).ok_or(Error::Corrupted)?;
+    let add_result = node_add(
+        buf.as_mut_slice(),
+        page_size,
+        insert_idx,
+        sep_key,
+        &[],
+        right_pgno,
+        NodeFlags::empty(),
+    );
+
+    match add_result {
+        Ok(()) => {
+            sub_db.root = path[0].pgno;
+            Ok(())
+        }
+        Err(Error::PageFull) => {
+            // Parent branch is full: split it too.
+            split_branch_sub_db(
+                txn,
+                sub_db,
+                path,
+                parent_level,
+                sep_key,
+                right_pgno,
+                insert_idx,
+            )
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Split a full branch page in a sub-database.
+fn split_branch_sub_db(
+    txn: &mut RwTransaction<'_>,
+    sub_db: &mut DbStat,
+    path: &TreePath,
+    branch_level: usize,
+    sep_key: &[u8],
+    child_pgno: u64,
+    insert_idx: usize,
+) -> Result<()> {
+    let page_size = txn.env.page_size;
+    let branch_pgno = path[branch_level].pgno;
+
+    let branch_buf = txn.dirty.find(branch_pgno).ok_or(Error::Corrupted)?;
+    let branch_page = branch_buf.as_page();
+    let nkeys = branch_page.num_keys();
+
+    let mut entries: Vec<BranchEntry> = Vec::with_capacity(nkeys + 1);
+    for i in 0..nkeys {
+        let node = branch_page.node(i);
+        entries.push(BranchEntry {
+            key: node.key().to_vec(),
+            child_pgno: node.child_pgno(),
+        });
+    }
+
+    entries.insert(
+        insert_idx,
+        BranchEntry {
+            key: sep_key.to_vec(),
+            child_pgno,
+        },
+    );
+
+    let total = entries.len();
+    let split_idx = total / 2;
+    let promoted_key = entries[split_idx].key.clone();
+
+    let (right_pgno, mut right_buf) = txn.page_alloc()?;
+    init_page(
+        right_buf.as_mut_slice(),
+        right_pgno,
+        PageFlags::BRANCH | PageFlags::DIRTY,
+        page_size,
+    );
+
+    let left_pgno = branch_pgno;
+    let left_buf = txn.dirty.find_mut(left_pgno).ok_or(Error::Corrupted)?;
+    init_page(
+        left_buf.as_mut_slice(),
+        left_pgno,
+        PageFlags::BRANCH | PageFlags::DIRTY,
+        page_size,
+    );
+
+    for (i, entry) in entries[..split_idx].iter().enumerate() {
+        node_add(
+            left_buf.as_mut_slice(),
+            page_size,
+            i,
+            &entry.key,
+            &[],
+            entry.child_pgno,
+            NodeFlags::empty(),
+        )?;
+    }
+
+    for (i, entry) in entries[split_idx..].iter().enumerate() {
+        let key = if i == 0 { &[] as &[u8] } else { &entry.key };
+        node_add(
+            right_buf.as_mut_slice(),
+            page_size,
+            i,
+            key,
+            &[],
+            entry.child_pgno,
+            NodeFlags::empty(),
+        )?;
+    }
+
+    txn.dirty.insert(right_pgno, right_buf);
+    sub_db.branch_pages += 1;
+
+    insert_separator_sub_db(
+        txn,
+        sub_db,
+        path,
+        branch_level,
+        &promoted_key,
+        left_pgno,
+        right_pgno,
+    )
+}
+
+/// Insert a value into an existing sub-database stored in a DUPSORT node.
+///
+/// Reads the `DbStat` from the node, inserts the value into the sub-DB's
+/// B+ tree, then updates the node with the new `DbStat`.
+#[allow(clippy::too_many_arguments)]
+fn dupsort_put_into_sub_db(
+    txn: &mut RwTransaction<'_>,
+    dbi: u32,
+    path: &TreePath,
+    leaf_pgno: u64,
+    insert_idx: usize,
+    data: &[u8],
+    flags: WriteFlags,
+    dcmp: &CmpFn,
+) -> Result<()> {
+    let page_size = txn.env.page_size;
+
+    // Read the sub-DB record from the node.
+    let leaf_buf = txn.dirty.find(leaf_pgno).ok_or(Error::Corrupted)?;
+    let leaf_page = leaf_buf.as_page();
+    let node = leaf_page.node(insert_idx);
+    let node_key = node.key().to_vec();
+    let mut sub_db = node.sub_db();
+
+    // Check if value already exists by searching the sub-DB.
+    if sub_db.root != P_INVALID {
+        let found = sub_db_contains(txn, &sub_db, data, dcmp)?;
+        if found {
+            if flags.contains(WriteFlags::NO_DUP_DATA) {
+                return Err(Error::KeyExist);
+            }
+            return Ok(());
+        }
+    }
+
+    // Insert the value into the sub-DB tree.
+    insert_into_sub_db_tree(txn, &mut sub_db, data)?;
+
+    // Update the node with the new DbStat.
+    let db_bytes = db_stat_to_bytes(&sub_db);
+    let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+    node_del(buf.as_mut_slice(), page_size, insert_idx);
+
+    let nf = NodeFlags::DUPDATA | NodeFlags::SUBDATA;
+    let add_result = node_add(
+        buf.as_mut_slice(),
+        page_size,
+        insert_idx,
+        &node_key,
+        &db_bytes,
+        0,
+        nf,
+    );
+
+    match add_result {
+        Ok(()) => {}
+        Err(Error::PageFull) => {
+            split_and_insert(
+                txn,
+                dbi,
+                path,
+                &node_key,
+                &db_bytes,
+                nf,
+                insert_idx,
+                &|a: &[u8], b: &[u8]| a.cmp(b),
+            )?;
+        }
+        Err(e) => return Err(e),
+    }
+
+    let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+    db_mut.root = path[0].pgno;
+    db_mut.entries += 1;
+    txn.db_dirty[dbi as usize] = true;
+    Ok(())
+}
+
+/// Check whether a value exists in a sub-database.
+fn sub_db_contains(
+    txn: &RwTransaction<'_>,
+    sub_db: &DbStat,
+    val: &[u8],
+    _dcmp: &CmpFn,
+) -> Result<bool> {
+    if sub_db.root == P_INVALID {
+        return Ok(false);
+    }
+
+    let page_size = txn.env.page_size;
+    let cmp: Box<CmpFn> = Box::new(|a: &[u8], b: &[u8]| a.cmp(b));
+
+    // Walk from root to leaf.
+    let mut current_pgno = sub_db.root;
+    loop {
+        let page = read_page(txn, current_pgno, page_size)?;
+
+        if page.is_leaf() {
+            let (idx, exact) = page_node_search(&page, val, &*cmp);
+            if exact && idx < page.num_keys() {
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        if !page.is_branch() {
+            return Err(Error::Corrupted);
+        }
+
+        let (idx, exact) = page_node_search(&page, val, &*cmp);
+        let child_idx = if exact {
+            idx
+        } else if idx > 0 {
+            idx - 1
+        } else {
+            0
+        };
+
+        current_pgno = page.node(child_idx).child_pgno();
+    }
+}
+
+/// Read a page from the dirty list or mmap (read-only, no COW).
+fn read_page<'a>(txn: &'a RwTransaction<'_>, pgno: u64, page_size: usize) -> Result<Page<'a>> {
+    if let Some(buf) = txn.dirty.find(pgno) {
+        return Ok(buf.as_page());
+    }
+    let ptr = txn.env.get_page(pgno)?;
+    // SAFETY: ptr points into the mmap which is valid for page_size bytes.
+    let slice = unsafe { std::slice::from_raw_parts(ptr, page_size) };
+    Ok(Page::from_raw(slice))
+}
+
+/// Read all values from a sub-database B+ tree.
+///
+/// Walks the sub-DB tree in order and collects all keys (which are the
+/// duplicate values).
+fn read_sub_db_values(txn: &RwTransaction<'_>, sub_db: &DbStat) -> Result<Vec<Vec<u8>>> {
+    if sub_db.root == P_INVALID {
+        return Ok(Vec::new());
+    }
+
+    let page_size = txn.env.page_size;
+    let mut vals = Vec::with_capacity(sub_db.entries as usize);
+    read_sub_db_leaf_values(txn, sub_db.root, page_size, &mut vals)?;
+    Ok(vals)
+}
+
+/// Recursively collect all values from a sub-database page.
+fn read_sub_db_leaf_values(
+    txn: &RwTransaction<'_>,
+    pgno: u64,
+    page_size: usize,
+    vals: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    let page = read_page(txn, pgno, page_size)?;
+
+    if page.is_leaf() {
+        let nkeys = page.num_keys();
+        for i in 0..nkeys {
+            let node = page.node(i);
+            vals.push(node.key().to_vec());
+        }
+        return Ok(());
+    }
+
+    if page.is_branch() {
+        let nkeys = page.num_keys();
+        for i in 0..nkeys {
+            let child_pgno = page.node(i).child_pgno();
+            read_sub_db_leaf_values(txn, child_pgno, page_size, vals)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Count the number of entries in a sub-database.
+fn sub_db_count(sub_db: &DbStat) -> u64 {
+    sub_db.entries
+}
+
+/// Get the first value from a sub-database B+ tree.
+///
+/// Walks to the leftmost leaf and returns the first key.
+#[allow(dead_code)]
+fn sub_db_first_value<'a>(
+    txn: &'a RwTransaction<'_>,
+    sub_db: &DbStat,
+    page_size: usize,
+) -> Result<Option<&'a [u8]>> {
+    if sub_db.root == P_INVALID {
+        return Ok(None);
+    }
+
+    let mut current_pgno = sub_db.root;
+    loop {
+        let page = read_page(txn, current_pgno, page_size)?;
+        if page.is_leaf() {
+            if page.num_keys() == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(page.node(0).key()));
+        }
+        if !page.is_branch() {
+            return Err(Error::Corrupted);
+        }
+        current_pgno = page.node(0).child_pgno();
+    }
+}
+
 /// Delete a single dup value from a DUPSORT node.
 fn dupsort_del_single(
     txn: &mut RwTransaction<'_>,
@@ -1620,6 +2334,13 @@ fn dupsort_del_single(
         db_mut.entries = db_mut.entries.saturating_sub(1);
         txn.db_dirty[dbi as usize] = true;
         return finish_del(txn, dbi, path, leaf_pgno, page_size);
+    }
+
+    // Check if this is a sub-database node.
+    if node.flags().contains(NodeFlags::SUBDATA) {
+        return dupsort_del_single_sub_db(
+            txn, dbi, path, leaf_pgno, idx, del_data, &node_key, dupfixed,
+        );
     }
 
     // Has sub-page: find and remove the value.
@@ -1686,10 +2407,120 @@ fn dupsort_del_single(
     Ok(())
 }
 
+/// Delete a single value from a sub-database.
+///
+/// Reads all values from the sub-DB, removes the target, and either:
+/// - Removes the entire node if no values remain
+/// - Converts back to a single value or sub-page if few values remain
+/// - Updates the sub-DB if many values remain
+#[allow(clippy::too_many_arguments)]
+fn dupsort_del_single_sub_db(
+    txn: &mut RwTransaction<'_>,
+    dbi: u32,
+    path: &TreePath,
+    leaf_pgno: u64,
+    idx: usize,
+    del_data: &[u8],
+    node_key: &[u8],
+    dupfixed: bool,
+) -> Result<()> {
+    let page_size = txn.env.page_size;
+    let node_max = txn.env.node_max;
+
+    // Read the sub-DB and collect all values.
+    let leaf_buf = txn.dirty.find(leaf_pgno).ok_or(Error::Corrupted)?;
+    let leaf_page = leaf_buf.as_page();
+    let node = leaf_page.node(idx);
+    let sub_db = node.sub_db();
+
+    let mut vals = read_sub_db_values(txn, &sub_db)?;
+
+    // Find the value to delete.
+    let mut found_idx = None;
+    for (i, v) in vals.iter().enumerate() {
+        if del_data.cmp(v) == Ordering::Equal {
+            found_idx = Some(i);
+            break;
+        }
+    }
+
+    let fi = found_idx.ok_or(Error::NotFound)?;
+    vals.remove(fi);
+
+    if vals.is_empty() {
+        // No more dups: remove the entire node.
+        let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        node_del(buf.as_mut_slice(), page_size, idx);
+
+        let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+        db_mut.entries = db_mut.entries.saturating_sub(1);
+        txn.db_dirty[dbi as usize] = true;
+        return finish_del(txn, dbi, path, leaf_pgno, page_size);
+    }
+
+    if vals.len() == 1 {
+        // Only one value left: convert back to single value.
+        let remaining = vals.into_iter().next().ok_or(Error::Corrupted)?;
+        let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        node_del(buf.as_mut_slice(), page_size, idx);
+        node_add(
+            buf.as_mut_slice(),
+            page_size,
+            idx,
+            node_key,
+            &remaining,
+            0,
+            NodeFlags::empty(),
+        )?;
+    } else {
+        // Try to convert back to sub-page if it fits.
+        let sub_page = build_sub_page(&vals, dupfixed);
+        if NODE_HEADER_SIZE + node_key.len() + sub_page.len() <= node_max {
+            // Fits as sub-page: demote from sub-DB.
+            let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+            node_del(buf.as_mut_slice(), page_size, idx);
+            node_add(
+                buf.as_mut_slice(),
+                page_size,
+                idx,
+                node_key,
+                &sub_page,
+                0,
+                NodeFlags::DUPDATA,
+            )?;
+        } else {
+            // Still too large for sub-page: rebuild as sub-DB.
+            let new_sub_db = promote_to_sub_db(txn, &vals, dupfixed)?;
+            let db_bytes = db_stat_to_bytes(&new_sub_db);
+            let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+            node_del(buf.as_mut_slice(), page_size, idx);
+            let nf = NodeFlags::DUPDATA | NodeFlags::SUBDATA;
+            node_add(
+                buf.as_mut_slice(),
+                page_size,
+                idx,
+                node_key,
+                &db_bytes,
+                0,
+                nf,
+            )?;
+        }
+    }
+
+    let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+    db_mut.root = path[0].pgno;
+    db_mut.entries = db_mut.entries.saturating_sub(1);
+    txn.db_dirty[dbi as usize] = true;
+    Ok(())
+}
+
 /// Count the number of duplicate values stored in a DUPSORT node.
 fn count_dups_in_node(node: &crate::page::Node<'_>) -> u64 {
     if !node.is_dupdata() {
         return 1;
+    }
+    if node.flags().contains(NodeFlags::SUBDATA) {
+        return sub_db_count(&node.sub_db());
     }
     let sp = node.sub_page();
     sp.num_keys() as u64
@@ -1699,17 +2530,48 @@ fn count_dups_in_node(node: &crate::page::Node<'_>) -> u64 {
 ///
 /// This is the public API for reading all dups from a node. Used by `get`
 /// and cursor operations.
+///
+/// For sub-database nodes (`DUPDATA | SUBDATA`), this returns an empty vec
+/// because walking the sub-DB tree requires transaction access. Use
+/// [`read_dup_values_with_txn`] instead when a transaction is available.
 pub fn read_dup_values(node: &crate::page::Node<'_>) -> Vec<Vec<u8>> {
     if !node.is_dupdata() {
         // Single value node.
         return vec![node.node_data().to_vec()];
     }
+    if node.flags().contains(NodeFlags::SUBDATA) {
+        // Sub-database: cannot read without transaction access.
+        return Vec::new();
+    }
     read_sub_page_values(node.node_data())
+}
+
+/// Read all duplicate values for a DUPSORT node, with transaction access
+/// for sub-database nodes.
+///
+/// # Errors
+///
+/// Returns an error if sub-database pages cannot be read.
+pub fn read_dup_values_with_txn(
+    node: &crate::page::Node<'_>,
+    txn: &RwTransaction<'_>,
+) -> Result<Vec<Vec<u8>>> {
+    if !node.is_dupdata() {
+        return Ok(vec![node.node_data().to_vec()]);
+    }
+    if node.flags().contains(NodeFlags::SUBDATA) {
+        let sub_db = node.sub_db();
+        return read_sub_db_values(txn, &sub_db);
+    }
+    Ok(read_sub_page_values(node.node_data()))
 }
 
 /// Search for a specific dup value in a DUPSORT node.
 ///
 /// Returns the dup value if found, or `None` if not found.
+///
+/// For sub-database nodes, this cannot search without transaction access
+/// and returns `None`.
 pub fn find_dup_value<'a>(
     node: &crate::page::Node<'a>,
     data: &[u8],
@@ -1720,6 +2582,11 @@ pub fn find_dup_value<'a>(
         if dcmp(data, existing) == Ordering::Equal {
             return Some(existing);
         }
+        return None;
+    }
+
+    if node.flags().contains(NodeFlags::SUBDATA) {
+        // Sub-database: cannot search without transaction access.
         return None;
     }
 
@@ -1750,11 +2617,19 @@ pub fn find_dup_value<'a>(
 /// Get the value at a specific dup index in a DUPSORT node.
 ///
 /// Returns `None` if the index is out of bounds.
+///
+/// For sub-database nodes, this cannot access the tree without a
+/// transaction and returns `None`.
 pub fn get_dup_at_index<'a>(node: &crate::page::Node<'a>, dup_idx: usize) -> Option<&'a [u8]> {
     if !node.is_dupdata() {
         if dup_idx == 0 {
             return Some(node.node_data());
         }
+        return None;
+    }
+
+    if node.flags().contains(NodeFlags::SUBDATA) {
+        // Sub-database: cannot access without transaction.
         return None;
     }
 
@@ -1777,6 +2652,9 @@ pub fn get_dup_at_index<'a>(node: &crate::page::Node<'a>, dup_idx: usize) -> Opt
 pub fn dup_count(node: &crate::page::Node<'_>) -> usize {
     if !node.is_dupdata() {
         return 1;
+    }
+    if node.flags().contains(NodeFlags::SUBDATA) {
+        return sub_db_count(&node.sub_db()) as usize;
     }
     node.sub_page().num_keys()
 }

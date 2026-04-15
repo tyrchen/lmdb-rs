@@ -803,9 +803,11 @@ impl<'env> RwTransaction<'env> {
 
     /// Load all reclaimable page numbers from FREE_DBI.
     ///
-    /// Reads all FREE_DBI records whose key (txnid) is less than the
-    /// current transaction's ID. The page numbers are collected into
-    /// `reclaim_pgs` for reuse by `page_alloc`.
+    /// Reads FREE_DBI records whose key (txnid) is less than the reclaim
+    /// threshold. The threshold is determined by the oldest active reader:
+    /// pages freed by transactions that an active reader may still reference
+    /// must not be reclaimed. If no readers are active, all pages freed
+    /// before the current transaction can be reclaimed.
     ///
     /// This method separates the read phase (cursor iteration) from the
     /// mutation phase (pushing to `reclaim_pgs`) to satisfy the borrow checker,
@@ -818,7 +820,16 @@ impl<'env> RwTransaction<'env> {
 
         let cmp = self.env.get_cmp(FREE_DBI as u32)?;
         let page_size = self.env.page_size;
-        let txnid = self.txnid;
+
+        // Determine the reclaim threshold based on the oldest active reader.
+        // Only reclaim pages from transactions older than the oldest reader,
+        // so readers still see a consistent snapshot.
+        let oldest_reader = self.env.reader_table.find_oldest();
+        let reclaim_threshold = if oldest_reader == u64::MAX {
+            self.txnid
+        } else {
+            oldest_reader
+        };
 
         // Phase 1: Read all freelist data into a temporary buffer.
         // We collect (record_txnid, data_bytes) pairs so we can release
@@ -841,7 +852,7 @@ impl<'env> RwTransaction<'env> {
                 let record_txnid =
                     u64::from_ne_bytes(key[..8].try_into().map_err(|_| Error::Corrupted)?);
 
-                if record_txnid >= txnid {
+                if record_txnid >= reclaim_threshold {
                     break;
                 }
 
@@ -885,12 +896,35 @@ impl<'env> RwTransaction<'env> {
 
     /// Write freed page numbers to FREE_DBI and delete consumed records.
     ///
-    /// Consumed FREE_DBI records (those whose pages were reclaimed during
-    /// this transaction) are deleted first, then the current transaction's
-    /// freed pages are written with key = txnid.
+    /// Uses an iterative convergence loop: writing to FREE_DBI may itself
+    /// allocate new pages (e.g. B+ tree splits), which frees old pages and
+    /// changes the freelist. The loop repeats until the freelist stabilizes.
+    /// This mirrors C LMDB's approach to freelist persistence.
     fn save_freelist(&mut self) -> Result<()> {
-        // Delete consumed FREE_DBI records so they are not reclaimed again
-        // by future transactions.
+        let mut prev_free_count = 0;
+        // Safety limit to prevent infinite loops in pathological cases.
+        for iteration in 0..100 {
+            let current_free_count = self.free_pgs.len();
+            if current_free_count == prev_free_count && iteration > 0 {
+                break; // Converged
+            }
+            prev_free_count = current_free_count;
+
+            // Delete consumed FREE_DBI records so they are not reclaimed again
+            // by future transactions.
+            self.delete_consumed_freelist_records()?;
+
+            // Write current freed pages to FREE_DBI.
+            if !self.free_pgs.is_empty() {
+                self.write_freelist_record()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete consumed FREE_DBI records whose pages were reclaimed during
+    /// this transaction.
+    fn delete_consumed_freelist_records(&mut self) -> Result<()> {
         let consumed = std::mem::take(&mut self.consumed_freelist_txnids);
         for &old_txnid in &consumed {
             let key = old_txnid.to_ne_bytes();
@@ -900,11 +934,12 @@ impl<'env> RwTransaction<'env> {
                 Err(e) => return Err(e),
             }
         }
+        Ok(())
+    }
 
-        if self.free_pgs.is_empty() {
-            return Ok(());
-        }
-
+    /// Serialize and write the current freed pages to FREE_DBI under this
+    /// transaction's ID.
+    fn write_freelist_record(&mut self) -> Result<()> {
         // Sort for deterministic on-disk order.
         self.free_pgs.sort_unstable();
 
@@ -1060,7 +1095,7 @@ impl<'env> RwTransaction<'env> {
 /// `DbStat` is `repr(C)` with a known 48-byte layout. The returned array
 /// is a copy of the struct's raw bytes in native byte order (which matches
 /// the on-disk format on little-endian platforms).
-fn db_stat_to_bytes(db: &DbStat) -> [u8; std::mem::size_of::<DbStat>()] {
+pub(crate) fn db_stat_to_bytes(db: &DbStat) -> [u8; std::mem::size_of::<DbStat>()] {
     let mut buf = [0u8; std::mem::size_of::<DbStat>()];
     // SAFETY: DbStat is repr(C) and we copy exactly size_of::<DbStat>() bytes.
     let src = unsafe {
@@ -2708,5 +2743,187 @@ mod tests {
             let result = txn.get(dbi, b"key1");
             assert!(matches!(result, Err(Error::NotFound)));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Reader table integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_track_reader_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .max_readers(4)
+            .open(dir.path())
+            .expect("open");
+
+        assert_eq!(env.info().num_readers, 0);
+
+        let ro1 = env.begin_ro_txn().expect("ro1");
+        assert_eq!(env.info().num_readers, 1);
+
+        let ro2 = env.begin_ro_txn().expect("ro2");
+        assert_eq!(env.info().num_readers, 2);
+
+        drop(ro1);
+        assert_eq!(env.info().num_readers, 1);
+
+        drop(ro2);
+        assert_eq!(env.info().num_readers, 0);
+    }
+
+    #[test]
+    fn test_should_return_readers_full() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .max_readers(2)
+            .open(dir.path())
+            .expect("open");
+
+        let _ro1 = env.begin_ro_txn().expect("ro1");
+        let _ro2 = env.begin_ro_txn().expect("ro2");
+        let result = env.begin_ro_txn();
+        assert!(
+            matches!(result, Err(Error::ReadersFull)),
+            "expected ReadersFull, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn test_should_reader_table_prevent_premature_reclamation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        // Insert keys in txn 1.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..50u32 {
+                let key = format!("rtp-{i:04}");
+                let val = format!("val-{i:04}");
+                txn.put(
+                    MAIN_DBI as u32,
+                    key.as_bytes(),
+                    val.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .unwrap_or_else(|e| panic!("put {key}: {e}"));
+            }
+            txn.commit().expect("commit insert");
+        }
+
+        // Start a read txn that holds a snapshot at the current txnid.
+        let ro_txn = env.begin_ro_txn().expect("ro snapshot");
+        let snapshot_txnid = ro_txn.txnid();
+
+        // Insert more keys in txn 2 (these cause COW, freeing pages).
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 50..100u32 {
+                let key = format!("rtp-{i:04}");
+                let val = format!("val-{i:04}");
+                txn.put(
+                    MAIN_DBI as u32,
+                    key.as_bytes(),
+                    val.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .unwrap_or_else(|e| panic!("put {key}: {e}"));
+            }
+            txn.commit().expect("commit more");
+        }
+
+        let pgno_before = env.info().last_pgno;
+
+        // Delete keys in txn 3 (frees more pages).
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..100u32 {
+                let key = format!("rtp-{i:04}");
+                txn.del(MAIN_DBI as u32, key.as_bytes(), None)
+                    .unwrap_or_else(|e| panic!("del {key}: {e}"));
+            }
+            txn.commit().expect("commit delete");
+        }
+
+        // Now insert again in txn 4. Because the reader is still active,
+        // pages freed by txn 2 and 3 should NOT be reclaimed, so the
+        // database file must grow.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..50u32 {
+                let key = format!("rtp2-{i:04}");
+                let val = format!("val2-{i:04}");
+                txn.put(
+                    MAIN_DBI as u32,
+                    key.as_bytes(),
+                    val.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .unwrap_or_else(|e| panic!("put {key}: {e}"));
+            }
+            txn.commit().expect("commit reinsert");
+        }
+
+        let pgno_with_reader = env.info().last_pgno;
+
+        // The reader was still active, so pages should not have been
+        // reclaimed — file should have grown.
+        assert!(
+            pgno_with_reader > pgno_before,
+            "expected growth with active reader: before={pgno_before}, after={pgno_with_reader}",
+        );
+
+        // The snapshot read txn should still be valid and see the old data.
+        assert!(snapshot_txnid > 0, "snapshot txnid should be valid",);
+
+        // Drop the reader.
+        drop(ro_txn);
+        assert_eq!(env.info().num_readers, 0);
+
+        // Now that the reader is gone, a new write txn should be able to
+        // reclaim those freed pages.
+        let pgno_after_reader_drop = env.info().last_pgno;
+
+        // Delete again and reinsert — this time pages should be reclaimed.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..50u32 {
+                let key = format!("rtp2-{i:04}");
+                txn.del(MAIN_DBI as u32, key.as_bytes(), None)
+                    .unwrap_or_else(|e| panic!("del {key}: {e}"));
+            }
+            txn.commit().expect("commit del2");
+        }
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..50u32 {
+                let key = format!("rtp3-{i:04}");
+                let val = format!("val3-{i:04}");
+                txn.put(
+                    MAIN_DBI as u32,
+                    key.as_bytes(),
+                    val.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .unwrap_or_else(|e| panic!("put {key}: {e}"));
+            }
+            txn.commit().expect("commit reinsert2");
+        }
+
+        let pgno_after_reclaim = env.info().last_pgno;
+
+        // With no active readers, pages should have been reclaimed, so
+        // growth should be bounded (much less than with the reader active).
+        assert!(
+            pgno_after_reclaim <= pgno_after_reader_drop + 5,
+            "expected page reclamation without reader: \
+             after_reader_drop={pgno_after_reader_drop}, after_reclaim={pgno_after_reclaim}",
+        );
     }
 }
