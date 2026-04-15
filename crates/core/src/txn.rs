@@ -229,6 +229,33 @@ impl<'env> RoTransaction<'env> {
         self.txnid
     }
 
+    /// Reset this read-only transaction, releasing its reader slot.
+    ///
+    /// The transaction handle can be reused later via [`renew`](Self::renew).
+    /// This allows recycling transactions without allocation overhead.
+    pub fn reset(&mut self) {
+        if let Some(slot) = self.reader_slot.take() {
+            self.env.reader_table.release(slot);
+        }
+    }
+
+    /// Renew a previously reset read-only transaction with a fresh snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BadTxn`] if the transaction is still active (not reset).
+    /// Returns [`Error::ReadersFull`] if no reader slots are available.
+    pub fn renew(&mut self) -> Result<()> {
+        if self.reader_slot.is_some() {
+            return Err(Error::BadTxn);
+        }
+        let meta = self.env.meta();
+        self.txnid = meta.txnid;
+        self.dbs = vec![meta.dbs[0], meta.dbs[1]];
+        self.reader_slot = Some(self.env.reader_table.acquire(self.txnid)?);
+        Ok(())
+    }
+
     /// Return statistics for the specified database.
     ///
     /// # Errors

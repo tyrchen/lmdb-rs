@@ -486,3 +486,228 @@ fn test_fp_stress_10k_keys_5_dbs_nested() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// txn reset/renew
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fp_txn_reset_renew() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = open_env(&dir);
+
+    // Write initial data
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        txn.put(MAIN_DBI, b"v1", b"first", WriteFlags::empty())
+            .expect("put");
+        txn.commit().expect("commit");
+    }
+
+    // Start read txn, verify, reset, write more data, renew, see new data
+    let mut ro = env.begin_ro_txn().expect("ro");
+    assert_eq!(ro.get(MAIN_DBI, b"v1").expect("get"), b"first");
+
+    ro.reset();
+
+    // Write more data while txn is reset
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        txn.put(MAIN_DBI, b"v2", b"second", WriteFlags::empty())
+            .expect("put");
+        txn.commit().expect("commit");
+    }
+
+    // Renew the txn — should see new data
+    ro.renew().expect("renew");
+    assert_eq!(ro.get(MAIN_DBI, b"v1").expect("get"), b"first");
+    assert_eq!(ro.get(MAIN_DBI, b"v2").expect("get"), b"second");
+}
+
+// ---------------------------------------------------------------------------
+// drop_db
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fp_drop_db_empty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = open_env(&dir);
+
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        let dbi = txn
+            .open_db(Some("to_empty"), DatabaseFlags::CREATE)
+            .expect("open");
+        txn.put(dbi, b"k1", b"v1", WriteFlags::empty())
+            .expect("put");
+        txn.put(dbi, b"k2", b"v2", WriteFlags::empty())
+            .expect("put");
+        txn.commit().expect("commit");
+    }
+
+    // Empty the database (del=false)
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        let dbi = txn
+            .open_db(Some("to_empty"), DatabaseFlags::CREATE)
+            .expect("open");
+        txn.drop_db(dbi, false).expect("drop_db");
+        txn.commit().expect("commit");
+    }
+
+    // DB should be empty but still exist
+    {
+        let mut txn = env.begin_ro_txn().expect("ro");
+        let dbi = txn.open_db(Some("to_empty")).expect("open");
+        assert!(matches!(txn.get(dbi, b"k1"), Err(Error::NotFound)));
+    }
+}
+
+#[test]
+fn test_fp_drop_db_delete() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = open_env(&dir);
+
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        let dbi = txn
+            .open_db(Some("to_delete"), DatabaseFlags::CREATE)
+            .expect("open");
+        txn.put(dbi, b"k", b"v", WriteFlags::empty()).expect("put");
+        txn.commit().expect("commit");
+    }
+
+    // Delete the database entirely (del=true)
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        let dbi = txn
+            .open_db(Some("to_delete"), DatabaseFlags::CREATE)
+            .expect("open");
+        txn.drop_db(dbi, true).expect("drop_db");
+        txn.commit().expect("commit");
+    }
+
+    // DB should not exist anymore
+    {
+        let mut txn = env.begin_ro_txn().expect("ro");
+        assert!(matches!(
+            txn.open_db(Some("to_delete")),
+            Err(Error::NotFound)
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MDB_APPEND
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fp_append_mode_sequential() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = open_env(&dir);
+
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        for i in 0..1000u32 {
+            let key = format!("k{i:06}");
+            txn.put(MAIN_DBI, key.as_bytes(), b"v", WriteFlags::APPEND)
+                .expect("put");
+        }
+        txn.commit().expect("commit");
+    }
+
+    // Verify all keys
+    {
+        let txn = env.begin_ro_txn().expect("ro");
+        let mut cursor = txn.open_cursor(MAIN_DBI).expect("cursor");
+        let count = cursor.iter().count();
+        assert_eq!(count, 1000);
+    }
+}
+
+#[test]
+fn test_fp_append_mode_out_of_order_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = open_env(&dir);
+
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        txn.put(MAIN_DBI, b"bbb", b"v", WriteFlags::APPEND)
+            .expect("first put");
+        // Inserting a key that is NOT greater should fail
+        let result = txn.put(MAIN_DBI, b"aaa", b"v", WriteFlags::APPEND);
+        assert!(matches!(result, Err(Error::KeyExist)));
+        txn.abort();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Write cursor
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fp_write_cursor_put() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = open_env(&dir);
+
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        let mut cursor = txn.open_rw_cursor(MAIN_DBI).expect("cursor");
+        cursor
+            .put(b"key1", b"val1", WriteFlags::empty())
+            .expect("put");
+        cursor
+            .put(b"key2", b"val2", WriteFlags::empty())
+            .expect("put");
+        cursor
+            .put(b"key3", b"val3", WriteFlags::empty())
+            .expect("put");
+        drop(cursor);
+        txn.commit().expect("commit");
+    }
+
+    {
+        let txn = env.begin_ro_txn().expect("ro");
+        assert_eq!(txn.get(MAIN_DBI, b"key1").expect("get"), b"val1");
+        assert_eq!(txn.get(MAIN_DBI, b"key2").expect("get"), b"val2");
+        assert_eq!(txn.get(MAIN_DBI, b"key3").expect("get"), b"val3");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Environment copy
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fp_env_copy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = open_env(&dir);
+
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        for i in 0..50 {
+            let key = format!("copy:{i:03}");
+            txn.put(MAIN_DBI, key.as_bytes(), b"data", WriteFlags::empty())
+                .expect("put");
+        }
+        txn.commit().expect("commit");
+    }
+
+    // Copy to a new location
+    let copy_dir = tempfile::tempdir().expect("tempdir");
+    let copy_path = copy_dir.path().join("backup.mdb");
+    env.copy(&copy_path).expect("copy");
+
+    // Open the copy and verify data
+    let env2 = Environment::builder()
+        .map_size(64 * 1024 * 1024)
+        .flags(lmdb_rs_core::types::EnvFlags::NO_SUB_DIR)
+        .open(&copy_path)
+        .expect("open copy");
+
+    let txn = env2.begin_ro_txn().expect("ro");
+    for i in 0..50 {
+        let key = format!("copy:{i:03}");
+        assert_eq!(txn.get(MAIN_DBI, key.as_bytes()).expect("get"), b"data");
+    }
+}

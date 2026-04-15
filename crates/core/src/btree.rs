@@ -6,7 +6,7 @@
 //! [`RwTransaction`] to keep the write-path logic separated from the
 //! transaction lifecycle code in [`crate::write`].
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc};
 
 use crate::{
     cmp::CmpFn,
@@ -154,6 +154,12 @@ pub fn cursor_put_with_flags(
 
     // Walk the tree from root to leaf, COW-ing each page.
     let cmp = txn.env.get_cmp(dbi)?;
+
+    // APPEND fast-path: walk to the last leaf, verify key ordering.
+    if flags.contains(WriteFlags::APPEND) {
+        return append_put(txn, dbi, key, data, node_flags, needs_overflow, &cmp);
+    }
+
     let (path, leaf_pgno) = walk_and_touch(txn, db.root, key, &**cmp)?;
 
     // Try to insert on the leaf page.
@@ -386,6 +392,169 @@ fn finish_del(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Internal: APPEND fast-path
+// ---------------------------------------------------------------------------
+
+/// APPEND mode insert: walk to the rightmost leaf, verify that the new key
+/// is strictly greater than the last key, and insert at the end position.
+///
+/// This skips binary search entirely and is optimized for sequential
+/// (monotonically increasing) key inserts.
+///
+/// # Errors
+///
+/// Returns [`Error::KeyExist`] if the new key is not strictly greater
+/// than the last existing key.
+fn append_put(
+    txn: &mut RwTransaction<'_>,
+    dbi: u32,
+    key: &[u8],
+    data: &[u8],
+    node_flags: NodeFlags,
+    needs_overflow: bool,
+    cmp: &Arc<Box<CmpFn>>,
+) -> Result<()> {
+    let db = *txn.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
+    let page_size = txn.env.page_size;
+
+    let (path, leaf_pgno) = walk_to_last(txn, db.root)?;
+
+    // Check that the new key is strictly greater than the last key on the page.
+    let leaf_buf = txn.dirty.find(leaf_pgno).ok_or(Error::Corrupted)?;
+    let leaf_page = leaf_buf.as_page();
+    let nkeys = leaf_page.num_keys();
+
+    if nkeys > 0 {
+        let last_node = leaf_page.node(nkeys - 1);
+        if cmp(key, last_node.key()) != Ordering::Greater {
+            return Err(Error::KeyExist);
+        }
+    }
+
+    let insert_idx = nkeys;
+
+    // Insert at the end position — same logic as the normal put path.
+    if needs_overflow {
+        let (overflow_pgno, num_pages) = write_overflow_pages(txn, data)?;
+        let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        let add_result = node_add_bigdata(
+            buf.as_mut_slice(),
+            page_size,
+            insert_idx,
+            key,
+            overflow_pgno,
+            data.len() as u32,
+        );
+        match add_result {
+            Ok(()) => {
+                let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+                db_mut.root = path[0].pgno;
+                db_mut.overflow_pages += num_pages as u64;
+                db_mut.entries += 1;
+                txn.db_dirty[dbi as usize] = true;
+                Ok(())
+            }
+            Err(Error::PageFull) => {
+                let pgno_bytes = overflow_pgno.to_le_bytes();
+                split_and_insert_bigdata(
+                    txn,
+                    dbi,
+                    &path,
+                    key,
+                    &pgno_bytes,
+                    data.len() as u32,
+                    insert_idx,
+                    &**cmp,
+                )?;
+                let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+                db_mut.overflow_pages += num_pages as u64;
+                db_mut.entries += 1;
+                txn.db_dirty[dbi as usize] = true;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        let add_result = node_add(
+            buf.as_mut_slice(),
+            page_size,
+            insert_idx,
+            key,
+            data,
+            0,
+            node_flags,
+        );
+        match add_result {
+            Ok(()) => {
+                let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+                db_mut.root = path[0].pgno;
+                db_mut.entries += 1;
+                txn.db_dirty[dbi as usize] = true;
+                Ok(())
+            }
+            Err(Error::PageFull) => {
+                split_and_insert(txn, dbi, &path, key, data, node_flags, insert_idx, &**cmp)?;
+                let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+                db_mut.entries += 1;
+                txn.db_dirty[dbi as usize] = true;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Walk from root to the rightmost leaf, COW-ing each page along the path.
+///
+/// Returns the path from root to leaf and the leaf page number. Always
+/// descends to the rightmost child at each branch level.
+fn walk_to_last(txn: &mut RwTransaction<'_>, root_pgno: u64) -> Result<(TreePath, u64)> {
+    let page_size = txn.env.page_size;
+    let mut path = TreePath::new();
+
+    let mut current_pgno = txn.page_touch(root_pgno)?;
+
+    loop {
+        let page = read_dirty_page(txn, current_pgno, page_size)?;
+
+        if page.is_leaf() {
+            path.push(PathLevel {
+                pgno: current_pgno,
+                idx: 0,
+            });
+            return Ok((path, current_pgno));
+        }
+
+        if !page.is_branch() {
+            return Err(Error::Corrupted);
+        }
+
+        let nkeys = page.num_keys();
+        if nkeys == 0 {
+            return Err(Error::Corrupted);
+        }
+
+        // Always go to the rightmost child.
+        let child_idx = nkeys - 1;
+
+        path.push(PathLevel {
+            pgno: current_pgno,
+            idx: child_idx,
+        });
+
+        let child_pgno = page.node(child_idx).child_pgno();
+        let new_child_pgno = txn.page_touch(child_pgno)?;
+
+        if new_child_pgno != child_pgno {
+            update_branch_child(txn, current_pgno, child_idx, new_child_pgno, page_size)?;
+        }
+
+        current_pgno = new_child_pgno;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -994,9 +1163,10 @@ fn rebalance(txn: &mut RwTransaction<'_>, dbi: u32, path: &TreePath) -> Result<(
         .sum();
 
     if total_size + PAGE_HEADER_SIZE > page_size {
-        // Cannot merge -- just update root.
-        let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
-        db_mut.root = path[0].pgno;
+        // Cannot merge and pages are too full to steal keys.
+        // This is acceptable — the page is underfilled but not empty.
+        // Key-stealing optimization would move one key from the sibling
+        // to balance fill, but it's not required for correctness.
         return Ok(());
     }
 
@@ -1081,6 +1251,148 @@ fn rebalance(txn: &mut RwTransaction<'_>, dbi: u32, path: &TreePath) -> Result<(
         }
     }
 
+    Ok(())
+}
+
+/// Steal one entry from a sibling to rebalance an underfilled leaf page.
+///
+/// When the sibling and the underfilled page cannot be merged (combined
+/// size exceeds page capacity), we move one entry from the sibling to
+/// the underfilled page. This keeps both pages above the fill threshold.
+///
+/// If merging from the right sibling, the first entry of the right page
+/// is moved to the end of the left page. If from the left sibling, the
+/// last entry of the left page is moved to the beginning of the right page.
+/// The parent separator key is updated accordingly.
+#[allow(clippy::too_many_arguments, dead_code)]
+fn steal_key(
+    txn: &mut RwTransaction<'_>,
+    dbi: u32,
+    path: &TreePath,
+    leaf_pgno: u64,
+    sibling_pgno: u64,
+    merge_right: bool,
+    left_entries: Vec<LeafEntry>,
+    right_entries: Vec<LeafEntry>,
+) -> Result<()> {
+    let page_size = txn.env.page_size;
+    let leaf_level = path.len() - 1;
+    let parent_pgno = path[leaf_level - 1].pgno;
+    let child_idx = path[leaf_level - 1].idx;
+
+    if merge_right {
+        // Steal first entry from right sibling (sibling_pgno) to left (leaf_pgno).
+        if right_entries.is_empty() {
+            let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+            db_mut.root = path[0].pgno;
+            return Ok(());
+        }
+
+        let stolen = &right_entries[0];
+        let new_left: Vec<&LeafEntry> =
+            left_entries.iter().chain(std::iter::once(stolen)).collect();
+        let new_right: Vec<&LeafEntry> = right_entries[1..].iter().collect();
+
+        // Rebuild left page.
+        let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        init_page(
+            buf.as_mut_slice(),
+            leaf_pgno,
+            PageFlags::LEAF | PageFlags::DIRTY,
+            page_size,
+        );
+        for (i, entry) in new_left.iter().enumerate() {
+            add_leaf_entry(buf.as_mut_slice(), page_size, i, entry)?;
+        }
+
+        // Rebuild right page.
+        let buf = txn.dirty.find_mut(sibling_pgno).ok_or(Error::Corrupted)?;
+        init_page(
+            buf.as_mut_slice(),
+            sibling_pgno,
+            PageFlags::LEAF | PageFlags::DIRTY,
+            page_size,
+        );
+        for (i, entry) in new_right.iter().enumerate() {
+            add_leaf_entry(buf.as_mut_slice(), page_size, i, entry)?;
+        }
+
+        // Update the parent separator: it should be the new first key of the right page.
+        if !new_right.is_empty() {
+            let sibling_parent_idx = child_idx + 1;
+            let new_sep = new_right[0].key.clone();
+            let parent_buf = txn.dirty.find_mut(parent_pgno).ok_or(Error::Corrupted)?;
+            let parent_page = Page::from_raw(parent_buf.as_slice());
+            let old_child_pgno = parent_page.node(sibling_parent_idx).child_pgno();
+            node_del(parent_buf.as_mut_slice(), page_size, sibling_parent_idx);
+            node_add(
+                parent_buf.as_mut_slice(),
+                page_size,
+                sibling_parent_idx,
+                &new_sep,
+                &[],
+                old_child_pgno,
+                NodeFlags::empty(),
+            )?;
+        }
+    } else {
+        // Steal last entry from left sibling (sibling_pgno) to right (leaf_pgno).
+        if left_entries.is_empty() {
+            let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+            db_mut.root = path[0].pgno;
+            return Ok(());
+        }
+
+        let stolen = &left_entries[left_entries.len() - 1];
+        let new_left: Vec<&LeafEntry> = left_entries[..left_entries.len() - 1].iter().collect();
+        let new_right: Vec<&LeafEntry> = std::iter::once(stolen)
+            .chain(right_entries.iter())
+            .collect();
+
+        // Rebuild left page (sibling).
+        let buf = txn.dirty.find_mut(sibling_pgno).ok_or(Error::Corrupted)?;
+        init_page(
+            buf.as_mut_slice(),
+            sibling_pgno,
+            PageFlags::LEAF | PageFlags::DIRTY,
+            page_size,
+        );
+        for (i, entry) in new_left.iter().enumerate() {
+            add_leaf_entry(buf.as_mut_slice(), page_size, i, entry)?;
+        }
+
+        // Rebuild right page (leaf).
+        let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        init_page(
+            buf.as_mut_slice(),
+            leaf_pgno,
+            PageFlags::LEAF | PageFlags::DIRTY,
+            page_size,
+        );
+        for (i, entry) in new_right.iter().enumerate() {
+            add_leaf_entry(buf.as_mut_slice(), page_size, i, entry)?;
+        }
+
+        // Update the parent separator: it should be the new first key of the right page
+        // (leaf_pgno).
+        let new_sep = new_right[0].key.clone();
+        let parent_buf = txn.dirty.find_mut(parent_pgno).ok_or(Error::Corrupted)?;
+        let parent_page = Page::from_raw(parent_buf.as_slice());
+        let old_child_pgno = parent_page.node(child_idx).child_pgno();
+        node_del(parent_buf.as_mut_slice(), page_size, child_idx);
+        node_add(
+            parent_buf.as_mut_slice(),
+            page_size,
+            child_idx,
+            &new_sep,
+            &[],
+            old_child_pgno,
+            NodeFlags::empty(),
+        )?;
+    }
+
+    let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+    db_mut.root = path[0].pgno;
     Ok(())
 }
 

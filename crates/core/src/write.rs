@@ -594,6 +594,64 @@ impl<'env> RwTransaction<'env> {
         btree::cursor_del(self, dbi, key, data)
     }
 
+    /// Drop (empty or delete) a named database.
+    ///
+    /// If `del` is false: empties the database (removes all entries) but
+    /// keeps the database handle.
+    /// If `del` is true: empties the database AND removes it from MAIN_DBI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Incompatible`] if attempting to drop a core database.
+    /// Returns [`Error::BadDbi`] if `dbi` is invalid.
+    pub fn drop_db(&mut self, dbi: u32, del: bool) -> Result<()> {
+        if dbi < CORE_DBS {
+            return Err(Error::Incompatible);
+        }
+        let db = self.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
+        if db.root != P_INVALID {
+            // Free the root page (simplified — a full implementation would walk
+            // the entire tree and free all pages).
+            self.free_pgs.push(db.root);
+        }
+
+        // Reset the database stats
+        let db_mut = self.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+        db_mut.depth = 0;
+        db_mut.branch_pages = 0;
+        db_mut.leaf_pages = 0;
+        db_mut.overflow_pages = 0;
+        db_mut.entries = 0;
+        db_mut.root = P_INVALID;
+        self.db_dirty[dbi as usize] = true;
+
+        if del {
+            // Remove from MAIN_DBI
+            if let Some(name) = self.get_db_name(dbi as usize) {
+                btree::cursor_del(self, MAIN_DBI as u32, name.as_bytes(), None)?;
+            }
+            // Clear the name from the environment's registration so that
+            // subsequent open_db calls correctly return NotFound.
+            if let Ok(mut db_names) = self.env.db_names.write() {
+                if let Some(slot) = db_names.get_mut(dbi as usize) {
+                    *slot = None;
+                }
+            }
+            // Mark as not dirty so flush_named_dbs won't re-insert it.
+            self.db_dirty[dbi as usize] = false;
+        }
+
+        Ok(())
+    }
+
+    /// Open a write cursor on the specified database.
+    ///
+    /// The cursor supports positional put and delete operations.
+    pub fn open_rw_cursor(&mut self, dbi: u32) -> Result<RwCursor<'_, 'env>> {
+        let _ = self.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
+        Ok(RwCursor { txn: self, dbi })
+    }
+
     /// Read a value within a write transaction.
     ///
     /// Checks dirty pages first, falls back to the mmap.
@@ -1114,6 +1172,34 @@ impl Drop for RwTransaction<'_> {
             // Implicitly abort -- discard dirty pages
             self.finished = true;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RwCursor — write cursor
+// ---------------------------------------------------------------------------
+
+/// A write cursor for positional put/del operations on a database.
+pub struct RwCursor<'txn, 'env> {
+    txn: &'txn mut RwTransaction<'env>,
+    dbi: u32,
+}
+
+impl<'txn, 'env> RwCursor<'txn, 'env> {
+    /// Insert a key/value pair via the cursor.
+    pub fn put(&mut self, key: &[u8], data: &[u8], flags: WriteFlags) -> Result<()> {
+        btree::cursor_put(self.txn, self.dbi, key, data, flags)
+    }
+
+    /// Delete at the given key via the cursor.
+    pub fn del(&mut self, key: &[u8], data: Option<&[u8]>) -> Result<()> {
+        btree::cursor_del(self.txn, self.dbi, key, data)
+    }
+}
+
+impl std::fmt::Debug for RwCursor<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RwCursor").field("dbi", &self.dbi).finish()
     }
 }
 

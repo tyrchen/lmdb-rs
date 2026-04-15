@@ -713,6 +713,32 @@ impl Environment {
         Ok(0)
     }
 
+    /// Create a plain (non-compacting) backup copy of the database.
+    ///
+    /// Opens a read transaction to get a consistent snapshot, then copies
+    /// all pages to the destination file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if file operations fail.
+    pub fn copy<P: AsRef<Path>>(&self, dest: P) -> Result<()> {
+        use std::io::Write as IoWrite;
+
+        let _txn = self.begin_ro_txn()?;
+        let meta = self.inner.meta();
+        let page_size = self.inner.page_size;
+        let num_pages = (meta.last_pgno + 1) as usize;
+
+        let mut file = fs::File::create(dest.as_ref())?;
+        for pgno in 0..num_pages {
+            let ptr = self.inner.get_page(pgno as u64)?;
+            let page_data = unsafe { std::slice::from_raw_parts(ptr, page_size) };
+            file.write_all(page_data)?;
+        }
+        file.sync_all()?;
+        Ok(())
+    }
+
     /// Access the shared inner state (for internal use by transactions).
     #[allow(dead_code)] // Used in later phases
     pub(crate) fn inner(&self) -> &Arc<EnvironmentInner> {

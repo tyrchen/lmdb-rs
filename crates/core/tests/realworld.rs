@@ -657,3 +657,113 @@ fn test_rw_complete_workflow() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 12. Bulk load with APPEND flag
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rw_bulk_load_with_append() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = env(&dir);
+
+    // Bulk load 5000 keys using APPEND mode for maximum speed.
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        for i in 0..5000u32 {
+            let key = format!("key:{i:08}");
+            let val = format!("payload-{i}");
+            txn.put(MAIN_DBI, key.as_bytes(), val.as_bytes(), WriteFlags::APPEND)
+                .unwrap_or_else(|e| panic!("append {i}: {e}"));
+        }
+        txn.commit().expect("commit");
+    }
+
+    // Verify all keys are readable and in order.
+    {
+        let txn = env.begin_ro_txn().expect("ro");
+        let mut cursor = txn.open_cursor(MAIN_DBI).expect("cursor");
+
+        let mut count = 0u32;
+        let mut prev_key: Option<Vec<u8>> = None;
+        for result in cursor.iter() {
+            let (k, _v) = result.expect("iter");
+            if let Some(ref pk) = prev_key {
+                assert!(k > pk.as_slice(), "keys must be in order");
+            }
+            prev_key = Some(k.to_vec());
+            count += 1;
+        }
+        assert_eq!(count, 5000);
+    }
+
+    // Verify a spot-check of values.
+    {
+        let txn = env.begin_ro_txn().expect("ro");
+        let val = txn.get(MAIN_DBI, b"key:00002500").expect("get");
+        assert_eq!(val, b"payload-2500");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 13. Transaction reset/renew loop
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rw_txn_reset_renew_loop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = env(&dir);
+
+    // Write some initial data.
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        for i in 0..10u32 {
+            let key = format!("k{i}");
+            let val = format!("v{i}");
+            txn.put(
+                MAIN_DBI,
+                key.as_bytes(),
+                val.as_bytes(),
+                WriteFlags::empty(),
+            )
+            .expect("put");
+        }
+        txn.commit().expect("commit");
+    }
+
+    // Use a single read transaction, reset/renewing it multiple times.
+    let mut txn = env.begin_ro_txn().expect("ro");
+    let initial_txnid = txn.txnid();
+    assert_eq!(txn.get(MAIN_DBI, b"k0").expect("get"), b"v0",);
+
+    // Reset the transaction.
+    txn.reset();
+
+    // While reset, write more data in a separate write transaction.
+    {
+        let mut wtxn = env.begin_rw_txn().expect("rw");
+        wtxn.put(MAIN_DBI, b"k10", b"v10", WriteFlags::empty())
+            .expect("put");
+        wtxn.commit().expect("commit");
+    }
+
+    // Renew and see the new data.
+    txn.renew().expect("renew");
+    assert!(txn.txnid() > initial_txnid);
+    assert_eq!(txn.get(MAIN_DBI, b"k10").expect("get new key"), b"v10",);
+
+    // Reset and renew again to verify it's reusable.
+    txn.reset();
+    txn.renew().expect("renew again");
+    assert_eq!(
+        txn.get(MAIN_DBI, b"k10").expect("get after second renew"),
+        b"v10",
+    );
+
+    // Verify renewing an active (non-reset) transaction fails.
+    let renew_result = txn.renew();
+    assert!(
+        matches!(renew_result, Err(Error::BadTxn)),
+        "renewing active txn should fail"
+    );
+}
