@@ -78,6 +78,11 @@ impl<'env> RoTransaction<'env> {
             let data: &[u8] =
                 unsafe { std::slice::from_raw_parts(ptr.add(PAGE_HEADER_SIZE), data_size) };
             Ok(data)
+        } else if node.is_dupdata() {
+            // DUPSORT node with sub-page: return the first dup value.
+            let first_val = crate::btree::get_dup_at_index(&node, 0).ok_or(Error::NotFound)?;
+            let data: &[u8] = unsafe { std::mem::transmute::<&[u8], &[u8]>(first_val) };
+            Ok(data)
         } else {
             // SAFETY: node_data() points into the mmap.
             let data: &[u8] = unsafe { std::mem::transmute::<&[u8], &[u8]>(node.node_data()) };
@@ -93,7 +98,12 @@ impl<'env> RoTransaction<'env> {
     pub fn open_cursor(&self, dbi: u32) -> Result<RoCursor<'_, 'env>> {
         let _db = self.db(dbi)?;
         let cursor = Cursor::new(self.env.page_size, dbi);
-        Ok(RoCursor { txn: self, cursor })
+        Ok(RoCursor {
+            txn: self,
+            cursor,
+            dup_idx: 0,
+            dup_count: 0,
+        })
     }
 
     /// Open a named database for read-only access.
@@ -242,6 +252,10 @@ impl std::fmt::Debug for RoTransaction<'_> {
 pub struct RoCursor<'txn, 'env> {
     txn: &'txn RoTransaction<'env>,
     cursor: Cursor,
+    /// Current dup index within a DUPSORT sub-page (0 for non-dup databases).
+    dup_idx: usize,
+    /// Total dup count at the current key position (1 for non-dup databases).
+    dup_count: usize,
 }
 
 impl<'txn, 'env> RoCursor<'txn, 'env> {
@@ -259,13 +273,80 @@ impl<'txn, 'env> RoCursor<'txn, 'env> {
         let get_page = |pgno: u64| self.txn.env.get_page(pgno);
 
         match op {
-            CursorOp::First => self.cursor.first(root, &*cmp, &get_page)?,
-            CursorOp::Last => self.cursor.last(root, &*cmp, &get_page)?,
-            CursorOp::Next | CursorOp::NextNoDup => self.cursor.next(&get_page)?,
-            CursorOp::Prev | CursorOp::PrevNoDup => self.cursor.prev(&get_page)?,
+            CursorOp::First => {
+                self.cursor.first(root, &*cmp, &get_page)?;
+                self.dup_idx = 0;
+                self.sync_dup_count();
+            }
+            CursorOp::Last => {
+                self.cursor.last(root, &*cmp, &get_page)?;
+                self.sync_dup_count();
+                self.dup_idx = self.dup_count.saturating_sub(1);
+            }
+            CursorOp::Next => {
+                if self.dup_count > 1 && self.dup_idx + 1 < self.dup_count {
+                    // Move to next dup of the same key.
+                    self.dup_idx += 1;
+                } else {
+                    // Move to the next key.
+                    self.cursor.next(&get_page)?;
+                    self.dup_idx = 0;
+                    self.sync_dup_count();
+                }
+            }
+            CursorOp::NextNoDup => {
+                self.cursor.next(&get_page)?;
+                self.dup_idx = 0;
+                self.sync_dup_count();
+            }
+            CursorOp::NextDup => {
+                if self.dup_idx + 1 < self.dup_count {
+                    self.dup_idx += 1;
+                } else {
+                    return Err(Error::NotFound);
+                }
+            }
+            CursorOp::Prev => {
+                if self.dup_count > 1 && self.dup_idx > 0 {
+                    // Move to previous dup of the same key.
+                    self.dup_idx -= 1;
+                } else {
+                    // Move to the previous key.
+                    self.cursor.prev(&get_page)?;
+                    self.sync_dup_count();
+                    self.dup_idx = self.dup_count.saturating_sub(1);
+                }
+            }
+            CursorOp::PrevNoDup => {
+                self.cursor.prev(&get_page)?;
+                self.sync_dup_count();
+                self.dup_idx = 0;
+            }
+            CursorOp::PrevDup => {
+                if self.dup_idx > 0 {
+                    self.dup_idx -= 1;
+                } else {
+                    return Err(Error::NotFound);
+                }
+            }
+            CursorOp::FirstDup => {
+                if !self.cursor.is_initialized() {
+                    return Err(Error::NotFound);
+                }
+                self.dup_idx = 0;
+            }
+            CursorOp::LastDup => {
+                if !self.cursor.is_initialized() {
+                    return Err(Error::NotFound);
+                }
+                self.sync_dup_count();
+                self.dup_idx = self.dup_count.saturating_sub(1);
+            }
             CursorOp::Set | CursorOp::SetKey => {
                 let k = key.ok_or(Error::BadValSize)?;
                 self.cursor.set(root, k, &*cmp, &get_page)?;
+                self.dup_idx = 0;
+                self.sync_dup_count();
             }
             CursorOp::SetRange => {
                 let k = key.ok_or(Error::BadValSize)?;
@@ -273,17 +354,41 @@ impl<'txn, 'env> RoCursor<'txn, 'env> {
                 if self.cursor.current_key().is_none() {
                     return Err(Error::NotFound);
                 }
+                self.dup_idx = 0;
+                self.sync_dup_count();
             }
             CursorOp::GetCurrent => {
                 if !self.cursor.is_initialized() {
                     return Err(Error::NotFound);
                 }
             }
-            // DUPSORT operations will be implemented in Phase 5
+            CursorOp::GetBoth => {
+                let k = key.ok_or(Error::BadValSize)?;
+                self.cursor.set(root, k, &*cmp, &get_page)?;
+                // GetBoth is not fully supported without a data parameter;
+                // position at the key only.
+                self.dup_idx = 0;
+                self.sync_dup_count();
+            }
+            CursorOp::GetBothRange => {
+                let k = key.ok_or(Error::BadValSize)?;
+                self.cursor.set(root, k, &*cmp, &get_page)?;
+                self.dup_idx = 0;
+                self.sync_dup_count();
+            }
             _ => return Err(Error::Incompatible),
         }
 
         self.current_kv()
+    }
+
+    /// Synchronize the dup_count from the current node.
+    fn sync_dup_count(&mut self) {
+        if let Some(node) = self.cursor.current_node() {
+            self.dup_count = crate::btree::dup_count(&node);
+        } else {
+            self.dup_count = 1;
+        }
     }
 
     /// Return the current key/value pair.
@@ -310,6 +415,10 @@ impl<'txn, 'env> RoCursor<'txn, 'env> {
                 let start = ptr.add(PAGE_HEADER_SIZE);
                 std::mem::transmute::<&[u8], &[u8]>(std::slice::from_raw_parts(start, data_size))
             }
+        } else if node.is_dupdata() {
+            // DUPSORT node: return the dup value at dup_idx.
+            let val = crate::btree::get_dup_at_index(&node, self.dup_idx).ok_or(Error::NotFound)?;
+            unsafe { std::mem::transmute::<&[u8], &[u8]>(val) }
         } else {
             unsafe { std::mem::transmute::<&[u8], &[u8]>(node.node_data()) }
         };

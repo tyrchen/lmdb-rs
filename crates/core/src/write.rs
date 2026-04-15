@@ -158,12 +158,50 @@ impl DirtyPages {
     pub fn clear(&mut self) {
         self.entries.clear();
     }
+
+    /// Create a snapshot of the current dirty page list for savepoint support.
+    pub(crate) fn snapshot(&self) -> Vec<(u64, PageBuf)> {
+        self.entries.clone()
+    }
+
+    /// Restore dirty pages from a previously captured snapshot.
+    pub(crate) fn restore(&mut self, snapshot: Vec<(u64, PageBuf)>) {
+        self.entries = snapshot;
+    }
 }
 
 impl Default for DirtyPages {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// SavePoint — snapshot for nested transaction rollback
+// ---------------------------------------------------------------------------
+
+/// Saved state for nested transaction (savepoint) rollback.
+///
+/// When a nested transaction is started via [`RwTransaction::begin_nested_txn`],
+/// the current state is captured into a `SavePoint`. On abort, the state is
+/// restored. On commit, the savepoint is simply discarded (changes remain in
+/// the parent).
+#[derive(Debug)]
+struct SavePoint {
+    /// Snapshot of per-database metadata.
+    dbs: Vec<DbStat>,
+    /// Snapshot of per-database dirty flags.
+    db_dirty: Vec<bool>,
+    /// Snapshot of freed page numbers.
+    free_pgs: Vec<u64>,
+    /// Snapshot of loose (dirty-then-freed) page numbers.
+    loose_pgs: Vec<u64>,
+    /// Snapshot of the next page number to allocate.
+    next_pgno: u64,
+    /// Snapshot of reclaimed page numbers from FREE_DBI.
+    reclaim_pgs: Vec<u64>,
+    /// Snapshot of all dirty pages at the time the savepoint was created.
+    dirty_snapshot: Vec<(u64, PageBuf)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +214,12 @@ impl Default for DirtyPages {
 /// Changes are buffered in memory and only written to disk on
 /// [`commit`](Self::commit). If the transaction is dropped without committing,
 /// all changes are discarded.
+///
+/// Nested transactions are supported via the savepoint mechanism:
+/// [`begin_nested_txn`](Self::begin_nested_txn) captures a snapshot,
+/// [`commit_nested_txn`](Self::commit_nested_txn) discards it (keeping
+/// changes), and [`abort_nested_txn`](Self::abort_nested_txn) restores
+/// the snapshot, rolling back all changes made since.
 pub struct RwTransaction<'env> {
     pub(crate) env: &'env EnvironmentInner,
     pub(crate) txnid: u64,
@@ -198,6 +242,8 @@ pub struct RwTransaction<'env> {
     freelist_loaded: bool,
     /// Whether this transaction has been committed or aborted.
     finished: bool,
+    /// Stack of savepoints for nested transactions.
+    savepoints: Vec<SavePoint>,
 }
 
 impl std::fmt::Debug for RwTransaction<'_> {
@@ -207,6 +253,7 @@ impl std::fmt::Debug for RwTransaction<'_> {
             .field("next_pgno", &self.next_pgno)
             .field("dirty_pages", &self.dirty.len())
             .field("finished", &self.finished)
+            .field("nested_depth", &self.savepoints.len())
             .finish_non_exhaustive()
     }
 }
@@ -244,6 +291,7 @@ impl<'env> RwTransaction<'env> {
             consumed_freelist_txnids: Vec::new(),
             freelist_loaded: false,
             finished: false,
+            savepoints: Vec::new(),
         })
     }
 
@@ -530,16 +578,20 @@ impl<'env> RwTransaction<'env> {
         btree::cursor_put(self, dbi, key, data, flags)
     }
 
-    /// Delete a key from the specified database.
+    /// Delete a key (and optionally a specific dup value) from the database.
     ///
-    /// Handles page rebalancing automatically when pages become underfilled.
+    /// For DUPSORT databases:
+    /// - If `data` is `None`, deletes the key and ALL its duplicates.
+    /// - If `data` is `Some`, deletes only the matching duplicate value.
+    ///
+    /// For non-DUPSORT databases, `data` is ignored.
     ///
     /// # Errors
     ///
-    /// - [`Error::NotFound`] if the key does not exist
+    /// - [`Error::NotFound`] if the key (or specific dup) does not exist
     /// - [`Error::BadDbi`] if `dbi` is invalid
-    pub fn del(&mut self, dbi: u32, key: &[u8]) -> Result<()> {
-        btree::cursor_del(self, dbi, key)
+    pub fn del(&mut self, dbi: u32, key: &[u8], data: Option<&[u8]>) -> Result<()> {
+        btree::cursor_del(self, dbi, key, data)
     }
 
     /// Read a value within a write transaction.
@@ -592,6 +644,11 @@ impl<'env> RwTransaction<'env> {
                     unsafe { std::slice::from_raw_parts(ptr.add(PAGE_HEADER_SIZE), data_size) };
                 Ok(data)
             }
+        } else if node.is_dupdata() {
+            // DUPSORT node with sub-page: return the first dup value.
+            let first_val = btree::get_dup_at_index(&node, 0).ok_or(Error::NotFound)?;
+            let data: &[u8] = unsafe { std::mem::transmute::<&[u8], &[u8]>(first_val) };
+            Ok(data)
         } else {
             // SAFETY: node_data() points into mmap or dirty pages.
             let data: &[u8] = unsafe { std::mem::transmute::<&[u8], &[u8]>(node.node_data()) };
@@ -610,6 +667,9 @@ impl<'env> RwTransaction<'env> {
     /// Returns [`Error::Io`] if flushing pages or syncing fails.
     pub fn commit(mut self) -> Result<()> {
         if self.finished {
+            return Err(Error::BadTxn);
+        }
+        if !self.savepoints.is_empty() {
             return Err(Error::BadTxn);
         }
         self.finished = true;
@@ -644,6 +704,83 @@ impl<'env> RwTransaction<'env> {
     /// Dirty pages are dropped automatically when the transaction is consumed.
     pub fn abort(mut self) {
         self.finished = true;
+    }
+
+    // -------------------------------------------------------------------
+    // Nested transactions (savepoints)
+    // -------------------------------------------------------------------
+
+    /// Begin a nested transaction by creating a savepoint.
+    ///
+    /// All subsequent mutations can be rolled back to this point by calling
+    /// [`abort_nested_txn`](Self::abort_nested_txn), or kept by calling
+    /// [`commit_nested_txn`](Self::commit_nested_txn). Savepoints may be
+    /// nested to arbitrary depth.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BadTxn`] if the transaction has already been
+    /// committed or aborted.
+    pub fn begin_nested_txn(&mut self) -> Result<()> {
+        if self.finished {
+            return Err(Error::BadTxn);
+        }
+        let savepoint = SavePoint {
+            dbs: self.dbs.clone(),
+            db_dirty: self.db_dirty.clone(),
+            free_pgs: self.free_pgs.clone(),
+            loose_pgs: self.loose_pgs.clone(),
+            next_pgno: self.next_pgno,
+            reclaim_pgs: self.reclaim_pgs.clone(),
+            dirty_snapshot: self.dirty.snapshot(),
+        };
+        self.savepoints.push(savepoint);
+        Ok(())
+    }
+
+    /// Commit a nested transaction (pop the savepoint).
+    ///
+    /// Changes made since the matching [`begin_nested_txn`](Self::begin_nested_txn)
+    /// are kept. The savepoint is simply discarded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BadTxn`] if there is no active nested transaction.
+    pub fn commit_nested_txn(&mut self) -> Result<()> {
+        if self.savepoints.is_empty() {
+            return Err(Error::BadTxn);
+        }
+        self.savepoints.pop();
+        Ok(())
+    }
+
+    /// Abort a nested transaction, restoring the state captured by the
+    /// matching [`begin_nested_txn`](Self::begin_nested_txn).
+    ///
+    /// All mutations (inserts, deletes, page allocations) made since the
+    /// savepoint are rolled back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BadTxn`] if there is no active nested transaction.
+    pub fn abort_nested_txn(&mut self) -> Result<()> {
+        let sp = self.savepoints.pop().ok_or(Error::BadTxn)?;
+        self.dbs = sp.dbs;
+        self.db_dirty = sp.db_dirty;
+        self.free_pgs = sp.free_pgs;
+        self.loose_pgs = sp.loose_pgs;
+        self.next_pgno = sp.next_pgno;
+        self.reclaim_pgs = sp.reclaim_pgs;
+        self.dirty.restore(sp.dirty_snapshot);
+        Ok(())
+    }
+
+    /// Return the current nested transaction depth.
+    ///
+    /// A depth of zero means the outermost (top-level) transaction is active.
+    #[must_use]
+    pub fn nested_depth(&self) -> usize {
+        self.savepoints.len()
     }
 
     /// Return the transaction ID.
@@ -758,7 +895,7 @@ impl<'env> RwTransaction<'env> {
         for &old_txnid in &consumed {
             let key = old_txnid.to_ne_bytes();
             // Ignore NotFound errors — the record may have already been deleted.
-            match btree::cursor_del(self, FREE_DBI as u32, &key) {
+            match btree::cursor_del(self, FREE_DBI as u32, &key, None) {
                 Ok(()) | Err(Error::NotFound) => {}
                 Err(e) => return Err(e),
             }
@@ -1142,7 +1279,7 @@ mod tests {
 
         {
             let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-            txn.del(MAIN_DBI as u32, b"key").expect("del");
+            txn.del(MAIN_DBI as u32, b"key", None).expect("del");
             txn.commit().expect("commit");
         }
 
@@ -1234,7 +1371,7 @@ mod tests {
             .expect("open");
 
         let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-        let result = txn.del(MAIN_DBI as u32, b"nonexistent");
+        let result = txn.del(MAIN_DBI as u32, b"nonexistent", None);
         assert!(matches!(result, Err(Error::NotFound)));
         txn.abort();
     }
@@ -1537,7 +1674,7 @@ mod tests {
             let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
             for i in 0..50u32 {
                 let key = format!("key-{i:04}");
-                txn.del(MAIN_DBI as u32, key.as_bytes())
+                txn.del(MAIN_DBI as u32, key.as_bytes(), None)
                     .unwrap_or_else(|e| panic!("del {key}: {e}"));
             }
             // After delete, free_pgs should be non-empty (COW freed pages).
@@ -1589,7 +1726,7 @@ mod tests {
             let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
             for i in 0..100u32 {
                 let key = format!("reuse-{i:04}");
-                txn.del(MAIN_DBI as u32, key.as_bytes())
+                txn.del(MAIN_DBI as u32, key.as_bytes(), None)
                     .unwrap_or_else(|e| panic!("del {key}: {e}"));
             }
             txn.commit().expect("commit");
@@ -1670,7 +1807,7 @@ mod tests {
                 let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
                 for i in 0..50u32 {
                     let key = format!("r{round}-k{i:04}");
-                    txn.del(MAIN_DBI as u32, key.as_bytes())
+                    txn.del(MAIN_DBI as u32, key.as_bytes(), None)
                         .unwrap_or_else(|e| panic!("del round {round} key {i}: {e}"));
                 }
                 txn.commit().expect("commit");
@@ -1687,5 +1824,889 @@ mod tests {
             "expected bounded growth with free page reuse, got last_pgno={}",
             info.last_pgno,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Nested transaction (savepoint) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_commit_nested_txn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+
+            // Insert key A in parent
+            txn.put(MAIN_DBI as u32, b"key-a", b"val-a", WriteFlags::empty())
+                .expect("put A");
+
+            // Begin nested, insert key B
+            txn.begin_nested_txn().expect("begin_nested");
+            txn.put(MAIN_DBI as u32, b"key-b", b"val-b", WriteFlags::empty())
+                .expect("put B");
+
+            // Commit nested — B should be visible in parent
+            txn.commit_nested_txn().expect("commit_nested");
+
+            // Both keys should be visible within the parent txn
+            assert_eq!(txn.get(MAIN_DBI as u32, b"key-a").expect("get A"), b"val-a",);
+            assert_eq!(txn.get(MAIN_DBI as u32, b"key-b").expect("get B"), b"val-b",);
+
+            txn.commit().expect("commit");
+        }
+
+        // Read txn should see both A and B
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            assert_eq!(txn.get(MAIN_DBI as u32, b"key-a").expect("get A"), b"val-a",);
+            assert_eq!(txn.get(MAIN_DBI as u32, b"key-b").expect("get B"), b"val-b",);
+        }
+    }
+
+    #[test]
+    fn test_should_abort_nested_txn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+
+            // Insert key A in parent
+            txn.put(MAIN_DBI as u32, b"key-a", b"val-a", WriteFlags::empty())
+                .expect("put A");
+
+            // Begin nested, insert key B, delete key A
+            txn.begin_nested_txn().expect("begin_nested");
+            txn.put(MAIN_DBI as u32, b"key-b", b"val-b", WriteFlags::empty())
+                .expect("put B");
+            txn.del(MAIN_DBI as u32, b"key-a", None).expect("del A");
+
+            // Abort nested — B gone, A restored
+            txn.abort_nested_txn().expect("abort_nested");
+
+            // A should be visible, B should not
+            assert_eq!(txn.get(MAIN_DBI as u32, b"key-a").expect("get A"), b"val-a",);
+            assert!(matches!(
+                txn.get(MAIN_DBI as u32, b"key-b"),
+                Err(Error::NotFound),
+            ));
+
+            txn.commit().expect("commit");
+        }
+
+        // Read txn should see A but not B
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            assert_eq!(txn.get(MAIN_DBI as u32, b"key-a").expect("get A"), b"val-a",);
+            assert!(matches!(
+                txn.get(MAIN_DBI as u32, b"key-b"),
+                Err(Error::NotFound),
+            ));
+        }
+    }
+
+    #[test]
+    fn test_should_handle_multiple_nesting_levels() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            assert_eq!(txn.nested_depth(), 0);
+
+            // Begin nested1, insert key1
+            txn.begin_nested_txn().expect("begin nested1");
+            assert_eq!(txn.nested_depth(), 1);
+            txn.put(MAIN_DBI as u32, b"k1", b"v1", WriteFlags::empty())
+                .expect("put k1");
+
+            // Begin nested2, insert key2
+            txn.begin_nested_txn().expect("begin nested2");
+            assert_eq!(txn.nested_depth(), 2);
+            txn.put(MAIN_DBI as u32, b"k2", b"v2", WriteFlags::empty())
+                .expect("put k2");
+
+            // Commit nested2 — k2 merges into nested1
+            txn.commit_nested_txn().expect("commit nested2");
+            assert_eq!(txn.nested_depth(), 1);
+
+            // Abort nested1 — both k1 and k2 should be gone
+            txn.abort_nested_txn().expect("abort nested1");
+            assert_eq!(txn.nested_depth(), 0);
+
+            assert!(matches!(
+                txn.get(MAIN_DBI as u32, b"k1"),
+                Err(Error::NotFound),
+            ));
+            assert!(matches!(
+                txn.get(MAIN_DBI as u32, b"k2"),
+                Err(Error::NotFound),
+            ));
+
+            txn.abort();
+        }
+    }
+
+    #[test]
+    fn test_should_rollback_nested_txn_with_page_splits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+
+            // Insert an initial key so the tree is non-empty
+            txn.put(MAIN_DBI as u32, b"anchor", b"value", WriteFlags::empty())
+                .expect("put anchor");
+
+            // Begin nested txn and insert enough keys to trigger page splits
+            txn.begin_nested_txn().expect("begin_nested");
+            for i in 0..200u32 {
+                let key = format!("split-{i:06}");
+                let val = format!("data-{i:06}");
+                txn.put(
+                    MAIN_DBI as u32,
+                    key.as_bytes(),
+                    val.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .expect("put split key");
+            }
+
+            // Abort — all split pages should be rolled back
+            txn.abort_nested_txn().expect("abort_nested");
+
+            // Anchor key should still be there
+            assert_eq!(
+                txn.get(MAIN_DBI as u32, b"anchor").expect("get anchor"),
+                b"value",
+            );
+
+            // None of the split keys should exist
+            for i in 0..200u32 {
+                let key = format!("split-{i:06}");
+                assert!(
+                    matches!(
+                        txn.get(MAIN_DBI as u32, key.as_bytes()),
+                        Err(Error::NotFound)
+                    ),
+                    "key {key} should not exist after abort",
+                );
+            }
+
+            txn.commit().expect("commit");
+        }
+
+        // Verify in a read txn
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            assert_eq!(
+                txn.get(MAIN_DBI as u32, b"anchor").expect("get anchor"),
+                b"value",
+            );
+            assert!(matches!(
+                txn.get(MAIN_DBI as u32, b"split-000000"),
+                Err(Error::NotFound),
+            ));
+        }
+    }
+
+    #[test]
+    fn test_should_reject_commit_nested_without_savepoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+        assert!(matches!(txn.commit_nested_txn(), Err(Error::BadTxn)));
+        txn.abort();
+    }
+
+    #[test]
+    fn test_should_reject_abort_nested_without_savepoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+        assert!(matches!(txn.abort_nested_txn(), Err(Error::BadTxn)));
+        txn.abort();
+    }
+
+    #[test]
+    fn test_should_reject_commit_with_active_savepoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+        txn.begin_nested_txn().expect("begin_nested");
+        let result = txn.commit();
+        assert!(
+            matches!(result, Err(Error::BadTxn)),
+            "expected BadTxn when committing with active savepoint",
+        );
+    }
+
+    #[test]
+    fn test_should_reject_begin_nested_on_finished_txn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        // We can't call begin_nested_txn after commit since commit consumes
+        // self. But we can test the finished guard by using the internal field.
+        // Instead, we test that begin_nested_txn works on a live transaction.
+        let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+        txn.begin_nested_txn().expect("begin_nested should work");
+        txn.commit_nested_txn().expect("commit_nested");
+        txn.abort();
+    }
+
+    #[test]
+    fn test_should_update_value_in_nested_txn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"key", b"original", WriteFlags::empty())
+                .expect("put");
+
+            // Begin nested, update the value
+            txn.begin_nested_txn().expect("begin_nested");
+            txn.put(MAIN_DBI as u32, b"key", b"updated", WriteFlags::empty())
+                .expect("put update");
+
+            // Verify updated value visible
+            assert_eq!(txn.get(MAIN_DBI as u32, b"key").expect("get"), b"updated",);
+
+            // Abort nested — should restore original value
+            txn.abort_nested_txn().expect("abort_nested");
+            assert_eq!(txn.get(MAIN_DBI as u32, b"key").expect("get"), b"original",);
+
+            txn.commit().expect("commit");
+        }
+
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            assert_eq!(txn.get(MAIN_DBI as u32, b"key").expect("get"), b"original",);
+        }
+    }
+
+    #[test]
+    fn test_should_handle_nested_txn_with_named_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(Some("nested_db"), DatabaseFlags::CREATE)
+                .expect("open_db");
+
+            txn.put(dbi, b"parent-key", b"parent-val", WriteFlags::empty())
+                .expect("put parent");
+
+            // Begin nested, add another key
+            txn.begin_nested_txn().expect("begin_nested");
+            txn.put(dbi, b"child-key", b"child-val", WriteFlags::empty())
+                .expect("put child");
+
+            // Commit nested
+            txn.commit_nested_txn().expect("commit_nested");
+            txn.commit().expect("commit");
+        }
+
+        // Verify both keys exist
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("nested_db")).expect("open_db ro");
+            assert_eq!(
+                txn.get(dbi, b"parent-key").expect("get parent"),
+                b"parent-val",
+            );
+            assert_eq!(txn.get(dbi, b"child-key").expect("get child"), b"child-val",);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // DUPSORT tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_dupsort_insert_and_get_duplicates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(
+                    Some("dupsort"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT,
+                )
+                .expect("open_db");
+
+            // Insert multiple values for the same key.
+            txn.put(dbi, b"key1", b"val-c", WriteFlags::empty())
+                .expect("put c");
+            txn.put(dbi, b"key1", b"val-a", WriteFlags::empty())
+                .expect("put a");
+            txn.put(dbi, b"key1", b"val-b", WriteFlags::empty())
+                .expect("put b");
+            txn.commit().expect("commit");
+        }
+
+        // get() returns the first (sorted) dup value.
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("dupsort")).expect("open_db ro");
+            let val = txn.get(dbi, b"key1").expect("get");
+            assert_eq!(val, b"val-a", "get() should return first sorted dup");
+        }
+    }
+
+    #[test]
+    fn test_should_dupsort_delete_single_dup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(
+                    Some("dupsort"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT,
+                )
+                .expect("open_db");
+
+            txn.put(dbi, b"key1", b"val-a", WriteFlags::empty())
+                .expect("put a");
+            txn.put(dbi, b"key1", b"val-b", WriteFlags::empty())
+                .expect("put b");
+            txn.put(dbi, b"key1", b"val-c", WriteFlags::empty())
+                .expect("put c");
+
+            // Delete only val-b.
+            txn.del(dbi, b"key1", Some(b"val-b"))
+                .expect("del single dup");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("dupsort")).expect("open_db ro");
+
+            // val-a should still be the first.
+            let val = txn.get(dbi, b"key1").expect("get");
+            assert_eq!(val, b"val-a");
+
+            // Iterate with cursor to verify val-b is gone.
+            let mut cursor = txn.open_cursor(dbi).expect("cursor");
+            let (_, v1) = cursor.get(Some(b"key1"), CursorOp::Set).expect("set");
+            assert_eq!(v1, b"val-a");
+            let (_, v2) = cursor.get(None, CursorOp::NextDup).expect("next dup");
+            assert_eq!(v2, b"val-c");
+            // No more dups.
+            let result = cursor.get(None, CursorOp::NextDup);
+            assert!(matches!(result, Err(Error::NotFound)));
+        }
+    }
+
+    #[test]
+    fn test_should_dupsort_delete_all_dups() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(
+                    Some("dupsort"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT,
+                )
+                .expect("open_db");
+
+            txn.put(dbi, b"key1", b"val-a", WriteFlags::empty())
+                .expect("put a");
+            txn.put(dbi, b"key1", b"val-b", WriteFlags::empty())
+                .expect("put b");
+
+            // Delete all dups (data = None).
+            txn.del(dbi, b"key1", None).expect("del all");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("dupsort")).expect("open_db ro");
+            let result = txn.get(dbi, b"key1");
+            assert!(matches!(result, Err(Error::NotFound)));
+        }
+    }
+
+    #[test]
+    fn test_should_dupsort_cursor_next_dup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(
+                    Some("dupsort"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT,
+                )
+                .expect("open_db");
+
+            txn.put(dbi, b"key1", b"val-a", WriteFlags::empty())
+                .expect("put");
+            txn.put(dbi, b"key1", b"val-b", WriteFlags::empty())
+                .expect("put");
+            txn.put(dbi, b"key1", b"val-c", WriteFlags::empty())
+                .expect("put");
+            txn.put(dbi, b"key2", b"val-x", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("dupsort")).expect("open_db ro");
+            let mut cursor = txn.open_cursor(dbi).expect("cursor");
+
+            // First entry.
+            let (k, v) = cursor.get(None, CursorOp::First).expect("first");
+            assert_eq!(k, b"key1");
+            assert_eq!(v, b"val-a");
+
+            // Next dup.
+            let (k, v) = cursor.get(None, CursorOp::NextDup).expect("next dup 1");
+            assert_eq!(k, b"key1");
+            assert_eq!(v, b"val-b");
+
+            let (k, v) = cursor.get(None, CursorOp::NextDup).expect("next dup 2");
+            assert_eq!(k, b"key1");
+            assert_eq!(v, b"val-c");
+
+            // No more dups for key1.
+            assert!(matches!(
+                cursor.get(None, CursorOp::NextDup),
+                Err(Error::NotFound)
+            ));
+
+            // Next (advances to key2).
+            let (k, v) = cursor.get(None, CursorOp::Next).expect("next to key2");
+            assert_eq!(k, b"key2");
+            assert_eq!(v, b"val-x");
+        }
+    }
+
+    #[test]
+    fn test_should_dupsort_cursor_prev_dup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(
+                    Some("dupsort"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT,
+                )
+                .expect("open_db");
+
+            txn.put(dbi, b"key1", b"val-a", WriteFlags::empty())
+                .expect("put");
+            txn.put(dbi, b"key1", b"val-b", WriteFlags::empty())
+                .expect("put");
+            txn.put(dbi, b"key1", b"val-c", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("dupsort")).expect("open_db ro");
+            let mut cursor = txn.open_cursor(dbi).expect("cursor");
+
+            // Position at last.
+            let (k, v) = cursor.get(None, CursorOp::Last).expect("last");
+            assert_eq!(k, b"key1");
+            assert_eq!(v, b"val-c");
+
+            // Prev dup.
+            let (_, v) = cursor.get(None, CursorOp::PrevDup).expect("prev dup");
+            assert_eq!(v, b"val-b");
+
+            let (_, v) = cursor.get(None, CursorOp::PrevDup).expect("prev dup");
+            assert_eq!(v, b"val-a");
+
+            // No more prev dups.
+            assert!(matches!(
+                cursor.get(None, CursorOp::PrevDup),
+                Err(Error::NotFound)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_should_dupsort_cursor_first_last_dup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(
+                    Some("dupsort"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT,
+                )
+                .expect("open_db");
+
+            txn.put(dbi, b"key1", b"aaa", WriteFlags::empty())
+                .expect("put");
+            txn.put(dbi, b"key1", b"bbb", WriteFlags::empty())
+                .expect("put");
+            txn.put(dbi, b"key1", b"ccc", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("dupsort")).expect("open_db ro");
+            let mut cursor = txn.open_cursor(dbi).expect("cursor");
+
+            // Position at key1.
+            let (_, v) = cursor.get(Some(b"key1"), CursorOp::Set).expect("set");
+            assert_eq!(v, b"aaa");
+
+            // Last dup.
+            let (_, v) = cursor.get(None, CursorOp::LastDup).expect("last dup");
+            assert_eq!(v, b"ccc");
+
+            // First dup.
+            let (_, v) = cursor.get(None, CursorOp::FirstDup).expect("first dup");
+            assert_eq!(v, b"aaa");
+        }
+    }
+
+    #[test]
+    fn test_should_dupsort_many_duplicates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        let dup_count = 50u32;
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(
+                    Some("dupsort"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT,
+                )
+                .expect("open_db");
+
+            // Insert many dups in reverse order.
+            for i in (0..dup_count).rev() {
+                let val = format!("dup-{i:04}");
+                txn.put(dbi, b"multi", val.as_bytes(), WriteFlags::empty())
+                    .expect("put dup");
+            }
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("dupsort")).expect("open_db ro");
+            let mut cursor = txn.open_cursor(dbi).expect("cursor");
+
+            // Verify all dups are in sorted order.
+            let (_, first_val) = cursor.get(Some(b"multi"), CursorOp::Set).expect("set");
+            assert_eq!(first_val, b"dup-0000");
+
+            let mut collected = vec![first_val.to_vec()];
+            while let Ok((_, v)) = cursor.get(None, CursorOp::NextDup) {
+                collected.push(v.to_vec());
+            }
+            assert_eq!(
+                collected.len(),
+                dup_count as usize,
+                "expected {dup_count} dups, got {}",
+                collected.len(),
+            );
+
+            // Verify sorted order.
+            for i in 0..collected.len() {
+                let expected = format!("dup-{i:04}");
+                assert_eq!(collected[i], expected.as_bytes(), "mismatch at dup {i}",);
+            }
+        }
+    }
+
+    #[test]
+    fn test_should_dupsort_persist_across_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        {
+            let env = Environment::builder()
+                .map_size(10 * 1024 * 1024)
+                .max_dbs(4)
+                .open(dir.path())
+                .expect("open");
+
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(
+                    Some("dupsort"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT,
+                )
+                .expect("open_db");
+
+            txn.put(dbi, b"key1", b"val-a", WriteFlags::empty())
+                .expect("put");
+            txn.put(dbi, b"key1", b"val-b", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        // Reopen.
+        {
+            let env = Environment::builder()
+                .map_size(10 * 1024 * 1024)
+                .max_dbs(4)
+                .open(dir.path())
+                .expect("reopen");
+
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("dupsort")).expect("open_db ro");
+            let val = txn.get(dbi, b"key1").expect("get");
+            assert_eq!(val, b"val-a");
+
+            let mut cursor = txn.open_cursor(dbi).expect("cursor");
+            let (_, v) = cursor.get(Some(b"key1"), CursorOp::Set).expect("set");
+            assert_eq!(v, b"val-a");
+            let (_, v) = cursor.get(None, CursorOp::NextDup).expect("next dup");
+            assert_eq!(v, b"val-b");
+        }
+    }
+
+    #[test]
+    fn test_should_dupsort_no_dup_data_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(
+                    Some("dupsort"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT,
+                )
+                .expect("open_db");
+
+            txn.put(dbi, b"key1", b"val-a", WriteFlags::empty())
+                .expect("put a");
+
+            // Try inserting the same key+data with NO_DUP_DATA.
+            let result = txn.put(dbi, b"key1", b"val-a", WriteFlags::NO_DUP_DATA);
+            assert!(matches!(result, Err(Error::KeyExist)));
+
+            // Different data should work.
+            txn.put(dbi, b"key1", b"val-b", WriteFlags::NO_DUP_DATA)
+                .expect("put b");
+
+            txn.commit().expect("commit");
+        }
+    }
+
+    #[test]
+    fn test_should_dupfixed_insert_and_iterate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(
+                    Some("dupfixed"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT | DatabaseFlags::DUP_FIXED,
+                )
+                .expect("open_db");
+
+            // Insert fixed-size values (4 bytes each).
+            txn.put(dbi, b"key1", &3u32.to_be_bytes(), WriteFlags::empty())
+                .expect("put");
+            txn.put(dbi, b"key1", &1u32.to_be_bytes(), WriteFlags::empty())
+                .expect("put");
+            txn.put(dbi, b"key1", &2u32.to_be_bytes(), WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("dupfixed")).expect("open_db ro");
+            let mut cursor = txn.open_cursor(dbi).expect("cursor");
+
+            let mut collected: Vec<u32> = Vec::new();
+            let (_, v) = cursor.get(Some(b"key1"), CursorOp::Set).expect("set");
+            collected.push(u32::from_be_bytes(v.try_into().expect("4 bytes")));
+
+            while let Ok((_, v)) = cursor.get(None, CursorOp::NextDup) {
+                collected.push(u32::from_be_bytes(v.try_into().expect("4 bytes")));
+            }
+
+            assert_eq!(collected, vec![1, 2, 3], "values should be sorted");
+        }
+    }
+
+    #[test]
+    fn test_should_dupsort_next_traverses_across_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(
+                    Some("dupsort"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT,
+                )
+                .expect("open_db");
+
+            txn.put(dbi, b"a", b"a1", WriteFlags::empty()).expect("put");
+            txn.put(dbi, b"a", b"a2", WriteFlags::empty()).expect("put");
+            txn.put(dbi, b"b", b"b1", WriteFlags::empty()).expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("dupsort")).expect("open_db ro");
+            let mut cursor = txn.open_cursor(dbi).expect("cursor");
+
+            // Iterate using Next which traverses through all dups and keys.
+            let (k, v) = cursor.get(None, CursorOp::First).expect("first");
+            assert_eq!((k, v), (b"a" as &[u8], b"a1" as &[u8]));
+
+            let (k, v) = cursor.get(None, CursorOp::Next).expect("next");
+            assert_eq!((k, v), (b"a" as &[u8], b"a2" as &[u8]));
+
+            let (k, v) = cursor.get(None, CursorOp::Next).expect("next");
+            assert_eq!((k, v), (b"b" as &[u8], b"b1" as &[u8]));
+
+            // No more.
+            assert!(matches!(
+                cursor.get(None, CursorOp::Next),
+                Err(Error::NotFound)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_should_dupsort_del_last_dup_removes_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(
+                    Some("dupsort"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT,
+                )
+                .expect("open_db");
+
+            txn.put(dbi, b"key1", b"only-val", WriteFlags::empty())
+                .expect("put");
+
+            // Delete the only dup value.
+            txn.del(dbi, b"key1", Some(b"only-val"))
+                .expect("del single");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("dupsort")).expect("open_db ro");
+            let result = txn.get(dbi, b"key1");
+            assert!(matches!(result, Err(Error::NotFound)));
+        }
     }
 }

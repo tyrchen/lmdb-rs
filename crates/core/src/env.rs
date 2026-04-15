@@ -287,6 +287,16 @@ impl EnvironmentInner {
         guard.get(dbi as usize).cloned().ok_or(Error::BadDbi)
     }
 
+    /// Return the database flags for `dbi`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BadDbi`] if `dbi` is out of range.
+    pub(crate) fn get_db_flags(&self, dbi: u32) -> Result<u16> {
+        let guard = self.db_flags.read().map_err(|_| Error::Panic)?;
+        guard.get(dbi as usize).copied().ok_or(Error::BadDbi)
+    }
+
     /// Return the raw file descriptor of the data file.
     #[cfg(unix)]
     pub(crate) fn data_fd(&self) -> std::os::fd::RawFd {

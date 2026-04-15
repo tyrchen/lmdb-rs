@@ -12,7 +12,7 @@ use crate::{
     cmp::CmpFn,
     error::{Error, Result},
     node::{init_page, leaf_size, node_add, node_add_bigdata, node_del},
-    page::Page,
+    page::{Page, even},
     types::*,
     write::{PageBuf, RwTransaction},
 };
@@ -165,7 +165,16 @@ pub fn cursor_put_with_flags(
     let (insert_idx, exact) = page_node_search(&leaf_page, key, &**cmp);
     let mut overwrite = false;
 
+    let db_is_dupsort = db.flags & DatabaseFlags::DUP_SORT.bits() as u16 != 0;
+
     if exact && insert_idx < nkeys {
+        if db_is_dupsort {
+            // DUPSORT: insert the value as a duplicate, don't overwrite the key
+            let dcmp = txn.env.get_dcmp(dbi)?;
+            return dupsort_put(
+                txn, dbi, &path, leaf_pgno, insert_idx, key, data, flags, &**dcmp,
+            );
+        }
         if flags.contains(WriteFlags::NO_OVERWRITE) {
             return Err(Error::KeyExist);
         }
@@ -268,7 +277,18 @@ pub fn cursor_put_with_flags(
 ///
 /// - [`Error::NotFound`] if the key does not exist
 /// - [`Error::BadDbi`] if the database handle is invalid
-pub fn cursor_del(txn: &mut RwTransaction<'_>, dbi: u32, key: &[u8]) -> Result<()> {
+///
+/// For DUPSORT databases:
+/// - If `dup_data` is `None`, deletes the key and ALL its duplicates.
+/// - If `dup_data` is `Some`, deletes only the matching duplicate value.
+///
+/// For non-DUPSORT databases, `dup_data` is ignored.
+pub fn cursor_del(
+    txn: &mut RwTransaction<'_>,
+    dbi: u32,
+    key: &[u8],
+    dup_data: Option<&[u8]>,
+) -> Result<()> {
     let db = *txn.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
     if db.root == P_INVALID {
         return Err(Error::NotFound);
@@ -297,6 +317,30 @@ pub fn cursor_del(txn: &mut RwTransaction<'_>, dbi: u32, key: &[u8]) -> Result<(
         }
     }
 
+    // Check if this is a DUPSORT database and we need to delete a specific dup.
+    let db_is_dupsort = db.flags & DatabaseFlags::DUP_SORT.bits() as u16 != 0;
+    if db_is_dupsort {
+        if let Some(del_data) = dup_data {
+            let dcmp = txn.env.get_dcmp(dbi)?;
+            return dupsort_del_single(txn, dbi, &path, leaf_pgno, idx, del_data, &**dcmp);
+        }
+        // dup_data is None: delete all dups (the whole key).
+        // For DUPSORT nodes with F_DUPDATA, count how many entries to subtract.
+        let node = leaf_page.node(idx);
+        if node.is_dupdata() {
+            let dup_count = count_dups_in_node(&node);
+            free_overflow_if_bigdata(txn, dbi, leaf_pgno, idx, page_size)?;
+            let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+            node_del(buf.as_mut_slice(), page_size, idx);
+
+            let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+            db_mut.entries = db_mut.entries.saturating_sub(dup_count);
+            txn.db_dirty[dbi as usize] = true;
+            return finish_del(txn, dbi, &path, leaf_pgno, page_size);
+        }
+        // Single value (no F_DUPDATA), fall through to normal delete.
+    }
+
     // Free overflow pages if this is a BIGDATA node.
     free_overflow_if_bigdata(txn, dbi, leaf_pgno, idx, page_size)?;
 
@@ -308,29 +352,35 @@ pub fn cursor_del(txn: &mut RwTransaction<'_>, dbi: u32, key: &[u8]) -> Result<(
     db_mut.entries = db_mut.entries.saturating_sub(1);
     txn.db_dirty[dbi as usize] = true;
 
-    // Check if the leaf is now empty.
+    finish_del(txn, dbi, &path, leaf_pgno, page_size)
+}
+
+/// Post-deletion handling: check for empty leaf and rebalance.
+fn finish_del(
+    txn: &mut RwTransaction<'_>,
+    dbi: u32,
+    path: &TreePath,
+    leaf_pgno: u64,
+    page_size: usize,
+) -> Result<()> {
     let leaf_page = txn.dirty.find(leaf_pgno).ok_or(Error::Corrupted)?.as_page();
 
     if leaf_page.num_keys() == 0 {
         if path.len() == 1 {
-            // Root leaf is empty -- database is now empty.
             let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
             db_mut.root = P_INVALID;
             db_mut.depth = 0;
             db_mut.leaf_pages = 0;
             return Ok(());
         }
-        // Non-root empty leaf -- remove from parent and rebalance.
-        remove_from_parent(txn, dbi, &path)?;
+        remove_from_parent(txn, dbi, path)?;
         return Ok(());
     }
 
-    // Page is not empty -- check if rebalancing is needed.
     let fill = leaf_page.used_space() * 10 / (page_size - PAGE_HEADER_SIZE);
     if path.len() > 1 && fill < FILL_THRESHOLD / 100 {
-        rebalance(txn, dbi, &path)?;
+        rebalance(txn, dbi, path)?;
     } else {
-        // Update root in db metadata (it may have changed due to COW).
         let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
         db_mut.root = path[0].pgno;
     }
@@ -1258,6 +1308,480 @@ fn split_and_insert_bigdata(
 }
 
 // ---------------------------------------------------------------------------
+// DUPSORT: sub-page helpers
+// ---------------------------------------------------------------------------
+
+/// Read all values from a sub-page (inline dup storage).
+///
+/// In a sub-page, the "keys" of nodes are the duplicate values. Nodes have no
+/// data field.
+fn read_sub_page_values(sub_page_data: &[u8]) -> Vec<Vec<u8>> {
+    let sp = Page::from_raw(sub_page_data);
+    let nkeys = sp.num_keys();
+    let mut vals = Vec::with_capacity(nkeys);
+
+    if sp.is_leaf2() {
+        let val_size = sp.pad() as usize;
+        for i in 0..nkeys {
+            vals.push(sp.leaf2_key(i, val_size).to_vec());
+        }
+    } else {
+        for i in 0..nkeys {
+            let node = sp.node(i);
+            vals.push(node.key().to_vec());
+        }
+    }
+    vals
+}
+
+/// Build a sub-page from a sorted list of values.
+///
+/// The sub-page uses `P_LEAF | P_SUBPAGE | P_DIRTY` flags. If `dupfixed` is
+/// true and all values have the same size, uses `P_LEAF2` compact format.
+fn build_sub_page(sorted_vals: &[Vec<u8>], dupfixed: bool) -> Vec<u8> {
+    if dupfixed && !sorted_vals.is_empty() {
+        let val_size = sorted_vals[0].len();
+        let all_same_size = sorted_vals.iter().all(|v| v.len() == val_size);
+        if all_same_size {
+            return build_leaf2_sub_page(sorted_vals, val_size);
+        }
+    }
+
+    // Calculate total space needed.
+    let mut total_node_space = 0usize;
+    for v in sorted_vals {
+        total_node_space += even(NODE_HEADER_SIZE + v.len());
+    }
+    let ptrs_space = sorted_vals.len() * 2;
+    let buf_size = PAGE_HEADER_SIZE + ptrs_space + total_node_space;
+
+    let mut buf = vec![0u8; buf_size];
+    let flags = PageFlags::LEAF | PageFlags::SUBPAGE | PageFlags::DIRTY;
+    // pgno = 0 for sub-pages (not meaningful)
+    buf[0..8].copy_from_slice(&0u64.to_le_bytes());
+    buf[8..10].copy_from_slice(&0u16.to_le_bytes());
+    buf[10..12].copy_from_slice(&flags.bits().to_le_bytes());
+    buf[12..14].copy_from_slice(&(PAGE_HEADER_SIZE as u16).to_le_bytes());
+    buf[14..16].copy_from_slice(&(buf_size as u16).to_le_bytes());
+
+    // Add each value as a node.
+    for (i, v) in sorted_vals.iter().enumerate() {
+        // node_add treats 'key' as the key and 'data' as data for leaf nodes.
+        // For sub-page nodes, the "key" is the dup value and data is empty.
+        // Index is simply `i` since we're appending in sorted order.
+        node_add(&mut buf, buf_size, i, v, &[], 0, NodeFlags::empty()).unwrap_or_else(|_| {
+            // Sub-page should never be full since we sized it correctly.
+            unreachable!("sub-page buffer should have enough space")
+        });
+    }
+
+    buf
+}
+
+/// Build a compact LEAF2 sub-page for DUPFIXED databases.
+fn build_leaf2_sub_page(sorted_vals: &[Vec<u8>], val_size: usize) -> Vec<u8> {
+    let data_size = sorted_vals.len() * val_size;
+    let buf_size = PAGE_HEADER_SIZE + data_size;
+    let mut buf = vec![0u8; buf_size];
+
+    let flags = PageFlags::LEAF | PageFlags::LEAF2 | PageFlags::SUBPAGE | PageFlags::DIRTY;
+    buf[0..8].copy_from_slice(&0u64.to_le_bytes());
+    buf[8..10].copy_from_slice(&(val_size as u16).to_le_bytes());
+    buf[10..12].copy_from_slice(&flags.bits().to_le_bytes());
+    // For LEAF2 pages, lower tracks num_keys via the formula:
+    // lower = PAGE_HEADER_SIZE (no pointer array for LEAF2)
+    // Instead, num_keys is derived from data length / val_size.
+    // But our Page::num_keys() uses (lower - PAGE_HEADER_SIZE) / 2.
+    // For LEAF2, we need lower = PAGE_HEADER_SIZE + num_keys * 2 to
+    // make num_keys() work correctly.
+    let lower = PAGE_HEADER_SIZE + sorted_vals.len() * 2;
+    buf[12..14].copy_from_slice(&(lower as u16).to_le_bytes());
+    buf[14..16].copy_from_slice(&(buf_size as u16).to_le_bytes());
+
+    // Pack values contiguously after header.
+    for (i, v) in sorted_vals.iter().enumerate() {
+        let start = PAGE_HEADER_SIZE + i * val_size;
+        buf[start..start + val_size].copy_from_slice(v);
+    }
+
+    buf
+}
+
+/// Handle DUPSORT insertion when the key already exists.
+#[allow(clippy::too_many_arguments)]
+fn dupsort_put(
+    txn: &mut RwTransaction<'_>,
+    dbi: u32,
+    path: &TreePath,
+    leaf_pgno: u64,
+    insert_idx: usize,
+    _key: &[u8],
+    data: &[u8],
+    flags: WriteFlags,
+    dcmp: &CmpFn,
+) -> Result<()> {
+    let page_size = txn.env.page_size;
+    let node_max = txn.env.node_max;
+    let db = *txn.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
+    let dupfixed = db.flags & DatabaseFlags::DUP_FIXED.bits() as u16 != 0;
+
+    let leaf_buf = txn.dirty.find(leaf_pgno).ok_or(Error::Corrupted)?;
+    let leaf_page = leaf_buf.as_page();
+    let node = leaf_page.node(insert_idx);
+
+    if !node.is_dupdata() {
+        // First duplicate: currently a single value, convert to sub-page.
+        let old_data = node.node_data().to_vec();
+        let node_key = node.key().to_vec();
+
+        let cmp_result = dcmp(data, &old_data);
+        if cmp_result == Ordering::Equal {
+            if flags.contains(WriteFlags::NO_DUP_DATA) {
+                return Err(Error::KeyExist);
+            }
+            // Same data already exists.
+            return Ok(());
+        }
+
+        // Sort the two values.
+        let sorted = if cmp_result == Ordering::Less {
+            vec![data.to_vec(), old_data]
+        } else {
+            vec![old_data, data.to_vec()]
+        };
+
+        let sub_page = build_sub_page(&sorted, dupfixed);
+
+        // Check if sub-page fits in the node.
+        if NODE_HEADER_SIZE + node_key.len() + sub_page.len() > node_max {
+            // Too large for a node, but this is unlikely for 2 values.
+            // Fall back: just store directly. In practice this would promote
+            // to a sub-DB but for correctness with small values, error out.
+            return Err(Error::BadValSize);
+        }
+
+        // Delete old node and insert new one with F_DUPDATA.
+        let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        node_del(buf.as_mut_slice(), page_size, insert_idx);
+
+        let add_result = node_add(
+            buf.as_mut_slice(),
+            page_size,
+            insert_idx,
+            &node_key,
+            &sub_page,
+            0,
+            NodeFlags::DUPDATA,
+        );
+
+        match add_result {
+            Ok(()) => {}
+            Err(Error::PageFull) => {
+                // Need to split the leaf page.
+                split_and_insert(
+                    txn,
+                    dbi,
+                    path,
+                    &node_key,
+                    &sub_page,
+                    NodeFlags::DUPDATA,
+                    insert_idx,
+                    &|a: &[u8], b: &[u8]| a.cmp(b),
+                )?;
+            }
+            Err(e) => return Err(e),
+        }
+
+        let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+        db_mut.root = path[0].pgno;
+        db_mut.entries += 1; // We added one new dup value.
+        txn.db_dirty[dbi as usize] = true;
+        return Ok(());
+    }
+
+    // Node already has F_DUPDATA: insert into existing sub-page.
+    let sub_page_data = node.node_data().to_vec();
+    let node_key = node.key().to_vec();
+
+    let mut vals = read_sub_page_values(&sub_page_data);
+
+    // Binary search for the insertion point.
+    let mut found = false;
+    let mut ins_pos = vals.len();
+    {
+        let mut lo = 0;
+        let mut hi = vals.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match dcmp(data, &vals[mid]) {
+                Ordering::Equal => {
+                    found = true;
+                    ins_pos = mid;
+                    break;
+                }
+                Ordering::Greater => lo = mid + 1,
+                Ordering::Less => hi = mid,
+            }
+        }
+        if !found {
+            ins_pos = lo;
+        }
+    }
+
+    if found {
+        if flags.contains(WriteFlags::NO_DUP_DATA) {
+            return Err(Error::KeyExist);
+        }
+        // Value already exists, nothing to do.
+        return Ok(());
+    }
+
+    // Insert the new value.
+    vals.insert(ins_pos, data.to_vec());
+
+    let new_sub_page = build_sub_page(&vals, dupfixed);
+
+    // Check if the new sub-page fits in a node.
+    if NODE_HEADER_SIZE + node_key.len() + new_sub_page.len() > node_max {
+        // Sub-page too large, promote to sub-database.
+        // For now, return an error since sub-DB promotion is complex.
+        // This limits DUPSORT to cases where dups fit in a sub-page.
+        return Err(Error::BadValSize);
+    }
+
+    // Delete old node and insert updated one.
+    let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+    node_del(buf.as_mut_slice(), page_size, insert_idx);
+
+    let add_result = node_add(
+        buf.as_mut_slice(),
+        page_size,
+        insert_idx,
+        &node_key,
+        &new_sub_page,
+        0,
+        NodeFlags::DUPDATA,
+    );
+
+    match add_result {
+        Ok(()) => {}
+        Err(Error::PageFull) => {
+            split_and_insert(
+                txn,
+                dbi,
+                path,
+                &node_key,
+                &new_sub_page,
+                NodeFlags::DUPDATA,
+                insert_idx,
+                &|a: &[u8], b: &[u8]| a.cmp(b),
+            )?;
+        }
+        Err(e) => return Err(e),
+    }
+
+    let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+    db_mut.root = path[0].pgno;
+    db_mut.entries += 1;
+    txn.db_dirty[dbi as usize] = true;
+    Ok(())
+}
+
+/// Delete a single dup value from a DUPSORT node.
+fn dupsort_del_single(
+    txn: &mut RwTransaction<'_>,
+    dbi: u32,
+    path: &TreePath,
+    leaf_pgno: u64,
+    idx: usize,
+    del_data: &[u8],
+    dcmp: &CmpFn,
+) -> Result<()> {
+    let page_size = txn.env.page_size;
+
+    let leaf_buf = txn.dirty.find(leaf_pgno).ok_or(Error::Corrupted)?;
+    let leaf_page = leaf_buf.as_page();
+    let node = leaf_page.node(idx);
+    let node_key = node.key().to_vec();
+    let db = *txn.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
+    let dupfixed = db.flags & DatabaseFlags::DUP_FIXED.bits() as u16 != 0;
+
+    if !node.is_dupdata() {
+        // Single value -- check if it matches.
+        let existing = node.node_data();
+        if dcmp(del_data, existing) != Ordering::Equal {
+            return Err(Error::NotFound);
+        }
+        // Delete the entire node (removing last dup = removing key).
+        let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        node_del(buf.as_mut_slice(), page_size, idx);
+
+        let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+        db_mut.entries = db_mut.entries.saturating_sub(1);
+        txn.db_dirty[dbi as usize] = true;
+        return finish_del(txn, dbi, path, leaf_pgno, page_size);
+    }
+
+    // Has sub-page: find and remove the value.
+    let sub_page_data = node.node_data().to_vec();
+    let mut vals = read_sub_page_values(&sub_page_data);
+
+    // Find the value to delete.
+    let mut found_idx = None;
+    for (i, v) in vals.iter().enumerate() {
+        if dcmp(del_data, v) == Ordering::Equal {
+            found_idx = Some(i);
+            break;
+        }
+    }
+
+    let fi = found_idx.ok_or(Error::NotFound)?;
+    vals.remove(fi);
+
+    if vals.is_empty() {
+        // No more dups -- remove the entire node.
+        let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        node_del(buf.as_mut_slice(), page_size, idx);
+
+        let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+        db_mut.entries = db_mut.entries.saturating_sub(1);
+        txn.db_dirty[dbi as usize] = true;
+        return finish_del(txn, dbi, path, leaf_pgno, page_size);
+    }
+
+    if vals.len() == 1 {
+        // Only one value left -- convert back from sub-page to single value.
+        let remaining = vals.into_iter().next().ok_or(Error::Corrupted)?;
+        let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        node_del(buf.as_mut_slice(), page_size, idx);
+        node_add(
+            buf.as_mut_slice(),
+            page_size,
+            idx,
+            &node_key,
+            &remaining,
+            0,
+            NodeFlags::empty(),
+        )?;
+    } else {
+        // Rebuild sub-page with remaining values.
+        let new_sub_page = build_sub_page(&vals, dupfixed);
+        let buf = txn.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        node_del(buf.as_mut_slice(), page_size, idx);
+        node_add(
+            buf.as_mut_slice(),
+            page_size,
+            idx,
+            &node_key,
+            &new_sub_page,
+            0,
+            NodeFlags::DUPDATA,
+        )?;
+    }
+
+    let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+    db_mut.root = path[0].pgno;
+    db_mut.entries = db_mut.entries.saturating_sub(1);
+    txn.db_dirty[dbi as usize] = true;
+    Ok(())
+}
+
+/// Count the number of duplicate values stored in a DUPSORT node.
+fn count_dups_in_node(node: &crate::page::Node<'_>) -> u64 {
+    if !node.is_dupdata() {
+        return 1;
+    }
+    let sp = node.sub_page();
+    sp.num_keys() as u64
+}
+
+/// Read all duplicate values for a DUPSORT node.
+///
+/// This is the public API for reading all dups from a node. Used by `get`
+/// and cursor operations.
+pub fn read_dup_values(node: &crate::page::Node<'_>) -> Vec<Vec<u8>> {
+    if !node.is_dupdata() {
+        // Single value node.
+        return vec![node.node_data().to_vec()];
+    }
+    read_sub_page_values(node.node_data())
+}
+
+/// Search for a specific dup value in a DUPSORT node.
+///
+/// Returns the dup value if found, or `None` if not found.
+pub fn find_dup_value<'a>(
+    node: &crate::page::Node<'a>,
+    data: &[u8],
+    dcmp: &CmpFn,
+) -> Option<&'a [u8]> {
+    if !node.is_dupdata() {
+        let existing = node.node_data();
+        if dcmp(data, existing) == Ordering::Equal {
+            return Some(existing);
+        }
+        return None;
+    }
+
+    let sp = node.sub_page();
+    let nkeys = sp.num_keys();
+
+    if sp.is_leaf2() {
+        let val_size = sp.pad() as usize;
+        for i in 0..nkeys {
+            let val = sp.leaf2_key(i, val_size);
+            if dcmp(data, val) == Ordering::Equal {
+                return Some(val);
+            }
+        }
+    } else {
+        for i in 0..nkeys {
+            let sub_node = sp.node(i);
+            let val = sub_node.key();
+            if dcmp(data, val) == Ordering::Equal {
+                return Some(val);
+            }
+        }
+    }
+
+    None
+}
+
+/// Get the value at a specific dup index in a DUPSORT node.
+///
+/// Returns `None` if the index is out of bounds.
+pub fn get_dup_at_index<'a>(node: &crate::page::Node<'a>, dup_idx: usize) -> Option<&'a [u8]> {
+    if !node.is_dupdata() {
+        if dup_idx == 0 {
+            return Some(node.node_data());
+        }
+        return None;
+    }
+
+    let sp = node.sub_page();
+    let nkeys = sp.num_keys();
+
+    if dup_idx >= nkeys {
+        return None;
+    }
+
+    if sp.is_leaf2() {
+        let val_size = sp.pad() as usize;
+        Some(sp.leaf2_key(dup_idx, val_size))
+    } else {
+        Some(sp.node(dup_idx).key())
+    }
+}
+
+/// Get the number of duplicate values in a DUPSORT node.
+pub fn dup_count(node: &crate::page::Node<'_>) -> usize {
+    if !node.is_dupdata() {
+        return 1;
+    }
+    node.sub_page().num_keys()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1387,7 +1911,7 @@ mod tests {
             let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
             for i in (0..count).step_by(2) {
                 let key = format!("dkey-{i:06}");
-                txn.del(MAIN_DBI, key.as_bytes())
+                txn.del(MAIN_DBI, key.as_bytes(), None)
                     .unwrap_or_else(|e| panic!("del {key}: {e}"));
             }
             txn.commit().expect("commit");
@@ -1731,7 +2255,7 @@ mod tests {
         // Delete it.
         {
             let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
-            txn.del(MAIN_DBI, b"del-key").expect("del overflow");
+            txn.del(MAIN_DBI, b"del-key", None).expect("del overflow");
             txn.commit().expect("commit");
         }
 

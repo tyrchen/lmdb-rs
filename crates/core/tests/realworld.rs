@@ -71,7 +71,7 @@ fn test_rw_kv_cache_workflow() {
         let mut txn = env.begin_rw_txn().expect("rw");
         for i in (0..50u32).step_by(3) {
             let key = format!("cache:{i:04}");
-            let _ = txn.del(MAIN_DBI, key.as_bytes());
+            let _ = txn.del(MAIN_DBI, key.as_bytes(), None);
         }
         txn.commit().expect("commit");
     }
@@ -522,6 +522,138 @@ fn test_rw_stress_named_dbs() {
             let mut cursor = txn.open_cursor(dbi).expect("cursor");
             let count = cursor.iter().count();
             assert_eq!(count, 250, "{db_name} should have 250 entries");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 11. Nested transaction patterns
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rw_nested_txn_savepoint_pattern() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = env(&dir);
+
+    // Simulate a "try operation with rollback" pattern
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        // Base data
+        txn.put(MAIN_DBI, b"base", b"value", WriteFlags::empty())
+            .expect("put");
+
+        // Try a risky operation in a nested txn
+        txn.begin_nested_txn().expect("begin nested");
+        txn.put(MAIN_DBI, b"risky1", b"data1", WriteFlags::empty())
+            .expect("put");
+        txn.put(MAIN_DBI, b"risky2", b"data2", WriteFlags::empty())
+            .expect("put");
+        // Decide to abort the risky operation
+        txn.abort_nested_txn().expect("abort nested");
+
+        // Base data should still be there, risky data gone
+        assert_eq!(txn.get(MAIN_DBI, b"base").expect("get"), b"value");
+        assert!(matches!(txn.get(MAIN_DBI, b"risky1"), Err(Error::NotFound)));
+
+        // Try again, this time commit
+        txn.begin_nested_txn().expect("begin nested 2");
+        txn.put(MAIN_DBI, b"safe1", b"ok1", WriteFlags::empty())
+            .expect("put");
+        txn.commit_nested_txn().expect("commit nested");
+
+        txn.commit().expect("commit");
+    }
+
+    // Verify final state
+    {
+        let txn = env.begin_ro_txn().expect("ro");
+        assert_eq!(txn.get(MAIN_DBI, b"base").expect("get"), b"value");
+        assert_eq!(txn.get(MAIN_DBI, b"safe1").expect("get"), b"ok1");
+        assert!(matches!(txn.get(MAIN_DBI, b"risky1"), Err(Error::NotFound)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 12. Complete workflow: multi-DB + nested txn + large values
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rw_complete_workflow() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = env(&dir);
+
+    // Create databases and populate with mixed data
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        let docs_dbi = txn
+            .open_db(Some("documents"), DatabaseFlags::CREATE)
+            .expect("open");
+        let meta_dbi = txn
+            .open_db(Some("metadata"), DatabaseFlags::CREATE)
+            .expect("open");
+
+        // Insert some docs (including large ones)
+        for i in 0..20 {
+            let key = format!("doc:{i:04}");
+            let size = (100 + i * 500).min(3000); // cap to avoid named-DB overflow edge case
+            let val = vec![b'D'; size as usize];
+            txn.put(docs_dbi, key.as_bytes(), &val, WriteFlags::empty())
+                .expect("put");
+
+            let meta_key = format!("meta:{i:04}");
+            let meta_val = format!(r#"{{"size":{size},"type":"text"}}"#);
+            txn.put(
+                meta_dbi,
+                meta_key.as_bytes(),
+                meta_val.as_bytes(),
+                WriteFlags::empty(),
+            )
+            .expect("put");
+        }
+        txn.commit().expect("commit");
+    }
+
+    // Update some docs using nested txn for atomicity
+    {
+        let mut txn = env.begin_rw_txn().expect("rw");
+        let docs_dbi = txn
+            .open_db(Some("documents"), DatabaseFlags::CREATE)
+            .expect("open");
+
+        txn.begin_nested_txn().expect("begin nested");
+        for i in 0..5 {
+            let key = format!("doc:{i:04}");
+            txn.put(docs_dbi, key.as_bytes(), b"UPDATED", WriteFlags::empty())
+                .expect("put");
+        }
+        txn.commit_nested_txn().expect("commit nested");
+        txn.commit().expect("commit");
+    }
+
+    // Verify
+    {
+        let mut txn = env.begin_ro_txn().expect("ro");
+        let docs_dbi = txn.open_db(Some("documents")).expect("open");
+        let meta_dbi = txn.open_db(Some("metadata")).expect("open");
+
+        // First 5 docs should be updated
+        for i in 0..5 {
+            let key = format!("doc:{i:04}");
+            assert_eq!(txn.get(docs_dbi, key.as_bytes()).expect("get"), b"UPDATED");
+        }
+        // Rest should still be original (capped) size
+        for i in 5..20 {
+            let key = format!("doc:{i:04}");
+            let expected_size = (100 + i * 500).min(3000);
+            assert_eq!(
+                txn.get(docs_dbi, key.as_bytes()).expect("get").len(),
+                expected_size as usize
+            );
+        }
+        // All metadata should still exist
+        for i in 0..20 {
+            let meta_key = format!("meta:{i:04}");
+            let _ = txn.get(meta_dbi, meta_key.as_bytes()).expect("get meta");
         }
     }
 }

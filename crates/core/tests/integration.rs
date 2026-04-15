@@ -62,7 +62,7 @@ fn test_e2e_put_get_del() {
     // Delete
     {
         let mut txn = env.begin_rw_txn().expect("rw txn");
-        txn.del(MAIN_DBI, b"greeting").expect("del");
+        txn.del(MAIN_DBI, b"greeting", None).expect("del");
         txn.commit().expect("commit");
     }
 
@@ -221,7 +221,7 @@ fn test_e2e_abort_discards_all_changes() {
         let mut txn = env.begin_rw_txn().expect("rw txn");
         txn.put(MAIN_DBI, b"discard", b"no", WriteFlags::empty())
             .expect("put");
-        txn.del(MAIN_DBI, b"keep").expect("del");
+        txn.del(MAIN_DBI, b"keep", None).expect("del");
         txn.abort();
     }
 
@@ -301,7 +301,7 @@ fn test_e2e_insert_delete_reinsert() {
         let mut txn = env.begin_rw_txn().expect("rw txn");
         for i in (1..100).step_by(2) {
             let key = format!("idr-{i:03}");
-            txn.del(MAIN_DBI, key.as_bytes()).expect("del");
+            txn.del(MAIN_DBI, key.as_bytes(), None).expect("del");
         }
         txn.commit().expect("commit");
     }
@@ -477,7 +477,7 @@ fn test_e2e_empty_database_operations() {
     {
         let mut txn = env.begin_rw_txn().expect("rw txn");
         assert!(matches!(
-            txn.del(MAIN_DBI, b"anything"),
+            txn.del(MAIN_DBI, b"anything", None),
             Err(Error::NotFound)
         ));
         txn.abort();
@@ -715,7 +715,7 @@ fn test_e2e_stress_5000_keys() {
         let mut txn = env.begin_rw_txn().expect("rw txn");
         for i in (0..n).step_by(3) {
             let key = format!("stress-{i:06}");
-            txn.del(MAIN_DBI, key.as_bytes()).expect("del");
+            txn.del(MAIN_DBI, key.as_bytes(), None).expect("del");
         }
         txn.commit().expect("commit");
     }
@@ -774,7 +774,7 @@ fn test_e2e_free_page_reuse() {
         let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
         for idx in 0..500u32 {
             let key = format!("free-{idx:06}");
-            txn.del(MAIN_DBI, key.as_bytes())
+            txn.del(MAIN_DBI, key.as_bytes(), None)
                 .unwrap_or_else(|e| panic!("del {key}: {e}"));
         }
         txn.commit().expect("commit");
@@ -871,7 +871,7 @@ fn test_e2e_overflow_large_values() {
         let mut txn = env.begin_rw_txn().expect("rw txn");
         for &size in &sizes {
             let key = format!("large-{size:06}");
-            txn.del(MAIN_DBI, key.as_bytes()).expect("del");
+            txn.del(MAIN_DBI, key.as_bytes(), None).expect("del");
         }
         txn.commit().expect("commit");
     }
