@@ -7,7 +7,7 @@
 use lmdb_rs_core::{
     env::Environment,
     error::Error,
-    types::{CursorOp, MAIN_DBI, WriteFlags},
+    types::{CursorOp, DatabaseFlags, MAIN_DBI, WriteFlags},
 };
 
 // ---------------------------------------------------------------------------
@@ -557,5 +557,182 @@ fn test_e2e_stat_after_writes() {
         assert_eq!(stat.entries, 10);
         assert!(stat.depth > 0);
         assert!(stat.page_size > 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Named databases
+// ---------------------------------------------------------------------------
+
+fn open_env_with_dbs(dir: &tempfile::TempDir) -> Environment {
+    Environment::builder()
+        .map_size(10 * 1024 * 1024)
+        .max_dbs(8)
+        .open(dir.path())
+        .expect("open env with dbs")
+}
+
+#[test]
+fn test_e2e_named_db_crud() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = open_env_with_dbs(&dir);
+
+    // Create and write to a named DB
+    {
+        let mut txn = env.begin_rw_txn().expect("rw txn");
+        let dbi = txn
+            .open_db(Some("users"), DatabaseFlags::CREATE)
+            .expect("open_db");
+        txn.put(dbi, b"alice", b"admin", WriteFlags::empty())
+            .expect("put");
+        txn.put(dbi, b"bob", b"user", WriteFlags::empty())
+            .expect("put");
+        txn.commit().expect("commit");
+    }
+
+    // Read back from named DB
+    {
+        let mut txn = env.begin_ro_txn().expect("ro txn");
+        let dbi = txn.open_db(Some("users")).expect("open_db ro");
+        assert_eq!(txn.get(dbi, b"alice").expect("get"), b"admin");
+        assert_eq!(txn.get(dbi, b"bob").expect("get"), b"user");
+    }
+
+    // Main DB should be unaffected
+    {
+        let txn = env.begin_ro_txn().expect("ro txn");
+        assert!(matches!(txn.get(MAIN_DBI, b"alice"), Err(Error::NotFound)));
+    }
+}
+
+#[test]
+fn test_e2e_multiple_named_dbs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = open_env_with_dbs(&dir);
+
+    // Create two named DBs
+    {
+        let mut txn = env.begin_rw_txn().expect("rw txn");
+        let db1 = txn
+            .open_db(Some("db1"), DatabaseFlags::CREATE)
+            .expect("open db1");
+        let db2 = txn
+            .open_db(Some("db2"), DatabaseFlags::CREATE)
+            .expect("open db2");
+
+        txn.put(db1, b"key", b"from-db1", WriteFlags::empty())
+            .expect("put db1");
+        txn.put(db2, b"key", b"from-db2", WriteFlags::empty())
+            .expect("put db2");
+        txn.commit().expect("commit");
+    }
+
+    // Each DB has its own data
+    {
+        let mut txn = env.begin_ro_txn().expect("ro txn");
+        let db1 = txn.open_db(Some("db1")).expect("open db1");
+        let db2 = txn.open_db(Some("db2")).expect("open db2");
+
+        assert_eq!(txn.get(db1, b"key").expect("get db1"), b"from-db1");
+        assert_eq!(txn.get(db2, b"key").expect("get db2"), b"from-db2");
+    }
+}
+
+#[test]
+fn test_e2e_named_db_persists_across_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let env = open_env_with_dbs(&dir);
+        let mut txn = env.begin_rw_txn().expect("rw txn");
+        let dbi = txn
+            .open_db(Some("persistent"), DatabaseFlags::CREATE)
+            .expect("open_db");
+        txn.put(dbi, b"data", b"survives", WriteFlags::empty())
+            .expect("put");
+        txn.commit().expect("commit");
+    }
+
+    {
+        let env = open_env_with_dbs(&dir);
+        let mut txn = env.begin_ro_txn().expect("ro txn");
+        let dbi = txn.open_db(Some("persistent")).expect("open_db ro");
+        assert_eq!(txn.get(dbi, b"data").expect("get"), b"survives");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stress tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_e2e_stress_5000_keys() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = Environment::builder()
+        .map_size(50 * 1024 * 1024) // 50 MB
+        .open(dir.path())
+        .expect("open");
+
+    let n = 5000;
+
+    // Insert all keys
+    {
+        let mut txn = env.begin_rw_txn().expect("rw txn");
+        for i in 0..n {
+            let key = format!("stress-{i:06}");
+            let val = format!("value-{i:06}-padding-to-make-it-longer");
+            txn.put(
+                MAIN_DBI,
+                key.as_bytes(),
+                val.as_bytes(),
+                WriteFlags::empty(),
+            )
+            .expect("put");
+        }
+        txn.commit().expect("commit");
+    }
+
+    // Verify all keys via cursor
+    {
+        let txn = env.begin_ro_txn().expect("ro txn");
+        let mut cursor = txn.open_cursor(MAIN_DBI).expect("cursor");
+        let mut count = 0;
+        let mut prev_key: Option<Vec<u8>> = None;
+
+        for result in cursor.iter() {
+            let (key, _) = result.expect("cursor next");
+            if let Some(ref pk) = prev_key {
+                assert!(key > pk.as_slice(), "keys out of order");
+            }
+            prev_key = Some(key.to_vec());
+            count += 1;
+        }
+        assert_eq!(count, n, "expected {n} keys, got {count}");
+    }
+
+    // Delete every 3rd key
+    {
+        let mut txn = env.begin_rw_txn().expect("rw txn");
+        for i in (0..n).step_by(3) {
+            let key = format!("stress-{i:06}");
+            txn.del(MAIN_DBI, key.as_bytes()).expect("del");
+        }
+        txn.commit().expect("commit");
+    }
+
+    // Verify remaining keys
+    {
+        let txn = env.begin_ro_txn().expect("ro txn");
+        let expected_remaining = n - ((n + 2) / 3);
+        let mut count = 0;
+        let mut cursor = txn.open_cursor(MAIN_DBI).expect("cursor");
+        for result in cursor.iter() {
+            let _ = result.expect("cursor next");
+            count += 1;
+        }
+        assert_eq!(
+            count, expected_remaining,
+            "expected {expected_remaining} remaining, got {count}"
+        );
     }
 }
