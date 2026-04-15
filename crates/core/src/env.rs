@@ -719,6 +719,27 @@ impl Environment {
         self.inner.flags
     }
 
+    /// Close a named database handle.
+    ///
+    /// This releases the slot occupied by the named database so it can be
+    /// reused by a future [`open_db`](crate::write::RwTransaction::open_db)
+    /// call. Core databases (FREE_DBI and MAIN_DBI) cannot be closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Incompatible`] if `dbi` refers to a core database.
+    /// Returns [`Error::Panic`] if an internal lock is poisoned.
+    pub fn close_db(&self, dbi: u32) -> Result<()> {
+        if dbi < CORE_DBS {
+            return Err(Error::Incompatible);
+        }
+        let mut db_names = self.inner.db_names.write().map_err(|_| Error::Panic)?;
+        if let Some(slot) = db_names.get_mut(dbi as usize) {
+            *slot = None;
+        }
+        Ok(())
+    }
+
     /// Sync the data file to disk.
     ///
     /// If `force` is true, a synchronous flush is performed even when

@@ -478,6 +478,22 @@ impl<'txn, 'env> RoCursor<'txn, 'env> {
         Ok((key, data))
     }
 
+    /// Return the number of duplicate values at the current cursor position.
+    ///
+    /// For non-DUPSORT databases this always returns 1. The cursor must be
+    /// positioned at a valid entry (i.e., initialized) before calling this
+    /// method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the cursor is not positioned.
+    pub fn count(&self) -> Result<usize> {
+        if !self.cursor.is_initialized() {
+            return Err(Error::NotFound);
+        }
+        Ok(self.dup_count)
+    }
+
     /// Create an iterator over all key/value pairs in the database,
     /// starting from the first entry.
     pub fn iter(&mut self) -> CursorIter<'txn, 'env, '_> {

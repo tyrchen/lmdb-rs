@@ -44,6 +44,10 @@ const FREE_DBI: usize = 0;
 /// Database index for the main B+ tree namespace.
 const MAIN_DBI: usize = 1;
 
+/// When the dirty list exceeds this many pages, spill some to disk early
+/// to prevent OOM on large transactions.
+const SPILL_THRESHOLD: usize = 4096;
+
 // ---------------------------------------------------------------------------
 // PageBuf — owned page buffer
 // ---------------------------------------------------------------------------
@@ -322,6 +326,55 @@ impl<'env> RwTransaction<'env> {
         self.env.get_page(pgno)
     }
 
+    /// Spill dirty pages to disk when the dirty list exceeds the threshold.
+    ///
+    /// Writes the first half of dirty pages (by pgno order) to their correct
+    /// positions on disk and removes them from the in-memory dirty list. This
+    /// prevents OOM on large transactions that touch many pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if writing pages to disk fails.
+    fn maybe_spill(&mut self) -> Result<()> {
+        if self.dirty.len() < SPILL_THRESHOLD {
+            return Ok(());
+        }
+        // Spill the first half of dirty pages (lowest pgnos).
+        let count = self.dirty.len() / 2;
+        let page_size = self.env.page_size;
+        let fd = self.env.data_fd();
+
+        // Collect pgnos to spill (cannot iterate and mutate simultaneously).
+        let to_spill: Vec<u64> = self
+            .dirty
+            .iter()
+            .take(count)
+            .map(|(pgno, _)| *pgno)
+            .collect();
+
+        // Write each spilled page to disk.
+        for &pgno in &to_spill {
+            if let Some(buf) = self.dirty.find(pgno) {
+                let offset = pgno as i64 * page_size as i64;
+                let data = buf.as_slice();
+                // SAFETY: fd is a valid file descriptor from the environment's
+                // data file. data points to a valid buffer for data.len() bytes.
+                let written = unsafe { libc::pwrite(fd, data.as_ptr().cast(), data.len(), offset) };
+                if written < 0 || written as usize != data.len() {
+                    return Err(Error::Io(std::io::Error::last_os_error()));
+                }
+            }
+        }
+
+        // Remove spilled pages from dirty list. After pwrite, the pages are
+        // on disk at their correct positions.
+        for pgno in to_spill {
+            self.dirty.remove(pgno);
+        }
+
+        Ok(())
+    }
+
     /// Allocate a new page buffer.
     ///
     /// Tries to reuse loose pages first (pages freed and dirtied in the same
@@ -331,6 +384,7 @@ impl<'env> RwTransaction<'env> {
     ///
     /// Returns [`Error::MapFull`] if the database has reached the map size limit.
     pub(crate) fn page_alloc(&mut self) -> Result<(u64, PageBuf)> {
+        self.maybe_spill()?;
         // 1. Try loose pages first (pages freed and dirtied in same txn)
         if let Some(pgno) = self.loose_pgs.pop() {
             if let Some(buf) = self.dirty.remove(pgno) {
@@ -363,6 +417,7 @@ impl<'env> RwTransaction<'env> {
     ///
     /// Returns [`Error::MapFull`] if the database has reached the map size limit.
     pub(crate) fn page_alloc_multi(&mut self, num: usize) -> Result<(u64, Vec<PageBuf>)> {
+        self.maybe_spill()?;
         let start_pgno = self.next_pgno;
         if start_pgno + num as u64 > self.env.max_pgno {
             return Err(Error::MapFull);
@@ -728,14 +783,14 @@ impl<'env> RwTransaction<'env> {
         if dbi < CORE_DBS {
             return Err(Error::Incompatible);
         }
-        let db = self.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
+        let db = *self.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
+
         if db.root != P_INVALID {
-            // Free the root page (simplified — a full implementation would walk
-            // the entire tree and free all pages).
-            self.free_pgs.push(db.root);
+            // Recursively walk the tree and free ALL pages.
+            self.free_tree_pages(db.root)?;
         }
 
-        // Reset the database stats
+        // Reset the database stats.
         let db_mut = self.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
         db_mut.depth = 0;
         db_mut.branch_pages = 0;
@@ -746,7 +801,7 @@ impl<'env> RwTransaction<'env> {
         self.db_dirty[dbi as usize] = true;
 
         if del {
-            // Remove from MAIN_DBI
+            // Remove from MAIN_DBI.
             if let Some(name) = self.get_db_name(dbi as usize) {
                 btree::cursor_del(self, MAIN_DBI as u32, name.as_bytes(), None)?;
             }
@@ -761,6 +816,70 @@ impl<'env> RwTransaction<'env> {
             self.db_dirty[dbi as usize] = false;
         }
 
+        Ok(())
+    }
+
+    /// Recursively walk a B+ tree and add all page numbers to `free_pgs`.
+    ///
+    /// This ensures that when a database is dropped, every page in its tree
+    /// (branch, leaf, overflow, and sub-database pages) is freed for reuse
+    /// by future transactions.
+    fn free_tree_pages(&mut self, pgno: u64) -> Result<()> {
+        if pgno == P_INVALID {
+            return Ok(());
+        }
+
+        let page_size = self.env.page_size;
+        let page_ptr = self.get_page(pgno)?;
+        // SAFETY: page_ptr points into the mmap or a dirty page buffer,
+        // both valid for page_size bytes.
+        let page_data = unsafe { std::slice::from_raw_parts(page_ptr, page_size) };
+        let page = Page::from_raw(page_data);
+
+        if page.is_branch() {
+            // Collect child pgnos before recursing to avoid aliasing issues.
+            let child_pgnos: Vec<u64> = (0..page.num_keys())
+                .map(|i| page.node(i).child_pgno())
+                .collect();
+            for child_pgno in child_pgnos {
+                self.free_tree_pages(child_pgno)?;
+            }
+        } else if page.is_leaf() && !page.is_leaf2() {
+            // Collect overflow and sub-database info before recursing.
+            let mut ovfl_ranges: Vec<(u64, u64)> = Vec::new();
+            let mut sub_roots: Vec<u64> = Vec::new();
+
+            for i in 0..page.num_keys() {
+                let node = page.node(i);
+                if node.is_bigdata() {
+                    let ovfl_pgno = node.overflow_pgno();
+                    let ovfl_ptr = self.get_page(ovfl_pgno)?;
+                    let ovfl_data = unsafe { std::slice::from_raw_parts(ovfl_ptr, page_size) };
+                    let ovfl_page = Page::from_raw(ovfl_data);
+                    let num_ovfl = u64::from(ovfl_page.overflow_pages());
+                    ovfl_ranges.push((ovfl_pgno, num_ovfl));
+                }
+                if node.is_subdata() {
+                    let sub_db = node.sub_db();
+                    if sub_db.root != P_INVALID {
+                        sub_roots.push(sub_db.root);
+                    }
+                }
+            }
+
+            for (ovfl_pgno, num_ovfl) in ovfl_ranges {
+                for p in 0..num_ovfl {
+                    self.free_pgs.push(ovfl_pgno + p);
+                }
+            }
+
+            for sub_root in sub_roots {
+                self.free_tree_pages(sub_root)?;
+            }
+        }
+
+        // Free this page itself.
+        self.free_pgs.push(pgno);
         Ok(())
     }
 
@@ -965,6 +1084,44 @@ impl<'env> RwTransaction<'env> {
     #[must_use]
     pub fn txnid(&self) -> u64 {
         self.txnid
+    }
+
+    /// Set a custom key comparison function for the specified database.
+    ///
+    /// The custom comparator replaces the default comparison (lexicographic,
+    /// reverse, or integer) for all subsequent operations within this
+    /// transaction and future transactions that open the same database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BadDbi`] if `dbi` is out of range.
+    /// Returns [`Error::Panic`] if the internal lock is poisoned.
+    pub fn set_compare(&self, dbi: u32, cmp: Box<crate::cmp::CmpFn>) -> Result<()> {
+        let mut db_cmp = self.env.db_cmp.write().map_err(|_| Error::Panic)?;
+        if dbi as usize >= db_cmp.len() {
+            return Err(Error::BadDbi);
+        }
+        db_cmp[dbi as usize] = Arc::new(cmp);
+        Ok(())
+    }
+
+    /// Set a custom data (duplicate) sort function for the specified database.
+    ///
+    /// Only meaningful for databases opened with `DUP_SORT`. The custom
+    /// comparator replaces the default data comparison for all subsequent
+    /// DUPSORT operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BadDbi`] if `dbi` is out of range.
+    /// Returns [`Error::Panic`] if the internal lock is poisoned.
+    pub fn set_dupsort(&self, dbi: u32, cmp: Box<crate::cmp::CmpFn>) -> Result<()> {
+        let mut db_dcmp = self.env.db_dcmp.write().map_err(|_| Error::Panic)?;
+        if dbi as usize >= db_dcmp.len() {
+            return Err(Error::BadDbi);
+        }
+        db_dcmp[dbi as usize] = Arc::new(cmp);
+        Ok(())
     }
 
     /// Try to reclaim a page from FREE_DBI records of older transactions.
@@ -3532,6 +3689,285 @@ mod tests {
             txn.put(MAIN_DBI as u32, b"k2", b"v2", WriteFlags::empty())
                 .expect("put");
             txn.commit().expect("commit");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Page spilling test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_handle_large_txn_triggering_spill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(512 * 1024 * 1024) // 512 MiB to hold 100K keys
+            .open(dir.path())
+            .expect("open");
+
+        // Insert 100K small keys in a single transaction. This will create
+        // enough dirty pages to trigger page spilling.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..100_000u64 {
+                let key = format!("spill-key-{i:08}");
+                let val = format!("spill-val-{i:08}");
+                txn.put(
+                    MAIN_DBI as u32,
+                    key.as_bytes(),
+                    val.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .unwrap_or_else(|e| panic!("put {key}: {e}"));
+            }
+            txn.commit().expect("commit");
+        }
+
+        // Verify all keys are readable.
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            for i in [0u64, 999, 49_999, 99_999] {
+                let key = format!("spill-key-{i:08}");
+                let expected_val = format!("spill-val-{i:08}");
+                let val = txn
+                    .get(MAIN_DBI as u32, key.as_bytes())
+                    .unwrap_or_else(|e| panic!("get {key}: {e}"));
+                assert_eq!(val, expected_val.as_bytes(), "mismatch at key {key}");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // drop_db test: free all pages
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_free_all_pages_on_drop_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(64 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        let dbi;
+        // Create a named DB with 1000 keys.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            dbi = txn
+                .open_db(Some("todrop"), DatabaseFlags::CREATE)
+                .expect("open_db");
+            for i in 0..1000u32 {
+                let key = format!("dk-{i:06}");
+                let val = format!("dv-{i:06}");
+                txn.put(dbi, key.as_bytes(), val.as_bytes(), WriteFlags::empty())
+                    .unwrap_or_else(|e| panic!("put {key}: {e}"));
+            }
+            txn.commit().expect("commit");
+        }
+
+        // Record the page count before dropping.
+        let info_before = env.info();
+
+        // Drop the database and delete it from MAIN_DBI.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            // Re-open the DB handle in this new txn.
+            let dbi2 = txn
+                .open_db(Some("todrop"), DatabaseFlags::empty())
+                .expect("open_db for drop");
+            txn.drop_db(dbi2, true).expect("drop_db");
+            txn.commit().expect("commit after drop");
+        }
+
+        // Verify the database no longer exists.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let result = txn.open_db(Some("todrop"), DatabaseFlags::empty());
+            assert!(
+                matches!(result, Err(Error::NotFound)),
+                "expected NotFound after drop_db, got {result:?}",
+            );
+            txn.abort();
+        }
+
+        // After another write txn, freed pages should be reclaimable,
+        // keeping the file from growing as much.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..500u32 {
+                let key = format!("new-{i:06}");
+                let val = format!("nv-{i:06}");
+                txn.put(
+                    MAIN_DBI as u32,
+                    key.as_bytes(),
+                    val.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .unwrap_or_else(|e| panic!("put {key}: {e}"));
+            }
+            txn.commit().expect("commit new data");
+        }
+
+        let info_after = env.info();
+        // The last_pgno should not have grown much because freed pages
+        // were reclaimed.
+        assert!(
+            info_after.last_pgno <= info_before.last_pgno + 50,
+            "expected page reuse after drop_db: before={}, after={}",
+            info_before.last_pgno,
+            info_after.last_pgno,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // cursor_count test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_count_dups_via_cursor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        // Create a DUPSORT database and insert duplicates.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(
+                    Some("dupdb"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT,
+                )
+                .expect("open_db");
+            txn.put(dbi, b"key1", b"val_a", WriteFlags::empty())
+                .expect("put a");
+            txn.put(dbi, b"key1", b"val_b", WriteFlags::empty())
+                .expect("put b");
+            txn.put(dbi, b"key1", b"val_c", WriteFlags::empty())
+                .expect("put c");
+            txn.put(dbi, b"key2", b"only", WriteFlags::empty())
+                .expect("put only");
+            txn.commit().expect("commit");
+        }
+
+        // Read with a cursor and check count.
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("dupdb")).expect("open_db ro");
+            let mut cursor = txn.open_cursor(dbi).expect("open_cursor");
+
+            // Position on key1.
+            cursor
+                .get(Some(b"key1"), crate::types::CursorOp::Set)
+                .expect("set key1");
+            let count = cursor.count().expect("count");
+            assert_eq!(count, 3, "key1 should have 3 dups");
+
+            // Position on key2.
+            cursor
+                .get(Some(b"key2"), crate::types::CursorOp::Set)
+                .expect("set key2");
+            let count = cursor.count().expect("count");
+            assert_eq!(count, 1, "key2 should have 1 dup");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // close_db test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_close_db_handle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        let dbi;
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            dbi = txn
+                .open_db(Some("closeme"), DatabaseFlags::CREATE)
+                .expect("open_db");
+            txn.put(dbi, b"k", b"v", WriteFlags::empty()).expect("put");
+            txn.commit().expect("commit");
+        }
+
+        // Close the handle.
+        env.close_db(dbi).expect("close_db");
+
+        // Closing a core DB should fail.
+        let result = env.close_db(0);
+        assert!(
+            matches!(result, Err(Error::Incompatible)),
+            "expected Incompatible for core DBI, got {result:?}",
+        );
+
+        // The named DB should still exist on disk; reopening should work.
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi2 = txn.open_db(Some("closeme")).expect("reopen after close");
+            let val = txn.get(dbi2, b"k").expect("get");
+            assert_eq!(val, b"v");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // set_compare test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_use_custom_comparator() {
+        use std::cmp::Ordering;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        // Create a database with a reverse-byte key comparator.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(Some("revcmp"), DatabaseFlags::CREATE)
+                .expect("open_db");
+
+            // Set a reverse comparator (sort keys in reverse order).
+            let reverse_cmp: Box<crate::cmp::CmpFn> =
+                Box::new(|a: &[u8], b: &[u8]| -> Ordering { b.cmp(a) });
+            txn.set_compare(dbi, reverse_cmp).expect("set_compare");
+
+            txn.put(dbi, b"aaa", b"first", WriteFlags::empty())
+                .expect("put aaa");
+            txn.put(dbi, b"ccc", b"third", WriteFlags::empty())
+                .expect("put ccc");
+            txn.put(dbi, b"bbb", b"second", WriteFlags::empty())
+                .expect("put bbb");
+            txn.commit().expect("commit");
+        }
+
+        // Read with a cursor and verify reverse order.
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("revcmp")).expect("open_db ro");
+            let mut cursor = txn.open_cursor(dbi).expect("open_cursor");
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            let mut it = cursor.iter();
+            while let Some(result) = it.next() {
+                let (k, _) = result.expect("iter");
+                keys.push(k.to_vec());
+            }
+            assert_eq!(
+                keys,
+                vec![b"ccc".to_vec(), b"bbb".to_vec(), b"aaa".to_vec()],
+                "keys should be in reverse order with custom comparator",
+            );
         }
     }
 }
