@@ -1164,16 +1164,6 @@ fn free_overflow_if_bigdata(
     Ok(())
 }
 
-/// A leaf entry for bigdata splits that preserves the actual data size.
-struct BigdataLeafEntry {
-    key: Vec<u8>,
-    /// Inline data (8-byte pgno for BIGDATA, or actual data for normal nodes).
-    data: Vec<u8>,
-    flags: NodeFlags,
-    /// For BIGDATA nodes, the actual data size to store in the node header.
-    actual_data_size: Option<u32>,
-}
-
 /// Split a full leaf page and insert a new bigdata entry, propagating the
 /// separator key up through the tree.
 #[allow(clippy::too_many_arguments)]
@@ -1196,7 +1186,7 @@ fn split_and_insert_bigdata(
     let leaf_page = leaf_buf.as_page();
     let nkeys = leaf_page.num_keys();
 
-    let mut entries: Vec<BigdataLeafEntry> = Vec::with_capacity(nkeys + 1);
+    let mut entries: Vec<LeafEntry> = Vec::with_capacity(nkeys + 1);
     for i in 0..nkeys {
         let node = leaf_page.node(i);
         let ads = if node.is_bigdata() {
@@ -1204,7 +1194,7 @@ fn split_and_insert_bigdata(
         } else {
             None
         };
-        entries.push(BigdataLeafEntry {
+        entries.push(LeafEntry {
             key: node.key().to_vec(),
             data: node.node_data().to_vec(),
             flags: node.flags(),
@@ -1215,7 +1205,7 @@ fn split_and_insert_bigdata(
     // Insert the new bigdata entry at the correct position.
     entries.insert(
         insert_idx,
-        BigdataLeafEntry {
+        LeafEntry {
             key: key.to_vec(),
             data: pgno_data.to_vec(),
             flags: NodeFlags::BIGDATA,
@@ -1245,27 +1235,14 @@ fn split_and_insert_bigdata(
         page_size,
     );
 
-    // Helper closure to add a bigdata-aware entry.
-    fn add_entry(page: &mut [u8], page_size: usize, i: usize, e: &BigdataLeafEntry) -> Result<()> {
-        if let Some(ads) = e.actual_data_size {
-            // BIGDATA entry: data is the 8-byte overflow pgno
-            let mut pgno_bytes = [0u8; 8];
-            pgno_bytes.copy_from_slice(&e.data[..8]);
-            let overflow_pgno = u64::from_le_bytes(pgno_bytes);
-            node_add_bigdata(page, page_size, i, &e.key, overflow_pgno, ads)
-        } else {
-            node_add(page, page_size, i, &e.key, &e.data, 0, e.flags)
-        }
-    }
-
     // Populate the left page.
     for (i, entry) in entries[..split_idx].iter().enumerate() {
-        add_entry(left_buf.as_mut_slice(), page_size, i, entry)?;
+        add_leaf_entry(left_buf.as_mut_slice(), page_size, i, entry)?;
     }
 
     // Populate the right page.
     for (i, entry) in entries[split_idx..].iter().enumerate() {
-        add_entry(right_buf.as_mut_slice(), page_size, i, entry)?;
+        add_leaf_entry(right_buf.as_mut_slice(), page_size, i, entry)?;
     }
 
     let sep_key = entries[split_idx].key.clone();
