@@ -22,10 +22,11 @@
 //! }
 //! ```
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc};
 
 use crate::{
     btree,
+    cmp::{default_cmp, default_dcmp},
     cursor::Cursor,
     env::EnvironmentInner,
     error::{Error, Result},
@@ -315,6 +316,170 @@ impl<'env> RwTransaction<'env> {
         Ok(new_pgno)
     }
 
+    /// Open or create a named database.
+    ///
+    /// If `name` is `None`, returns the handle for the default (main) database.
+    /// If `name` is `Some`, looks up the named database in the main database.
+    /// If not found and `DatabaseFlags::CREATE` is set, creates a new empty
+    /// named database.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if the named database does not exist and `CREATE` is not set
+    /// - [`Error::DbsFull`] if the maximum number of named databases has been reached
+    /// - [`Error::BadDbi`] if the environment was not configured with `max_dbs > 0`
+    pub fn open_db(&mut self, name: Option<&str>, flags: DatabaseFlags) -> Result<u32> {
+        if let Some(name) = name {
+            if self.env.max_dbs == 0 {
+                return Err(Error::BadDbi);
+            }
+            self.find_or_create_db(name, flags)
+        } else {
+            Ok(MAIN_DBI as u32)
+        }
+    }
+
+    /// Look up or create a named database.
+    fn find_or_create_db(&mut self, name: &str, flags: DatabaseFlags) -> Result<u32> {
+        // Search MAIN_DBI for the name.
+        let main_db = self.dbs[MAIN_DBI];
+        if main_db.root != P_INVALID {
+            let cmp = self.env.get_cmp(MAIN_DBI as u32)?;
+            let mut cursor = Cursor::new(self.env.page_size, MAIN_DBI as u32);
+            let get_page = |pgno: u64| -> Result<*const u8> { self.get_page(pgno) };
+            if cursor
+                .page_search(main_db.root, Some(name.as_bytes()), &*cmp, &get_page)
+                .is_ok()
+            {
+                if let Some(node) = cursor.current_node() {
+                    if cmp(name.as_bytes(), node.key()) == Ordering::Equal && node.is_subdata() {
+                        let db_stat = node.sub_db();
+                        return self.register_db(name, db_stat, flags);
+                    }
+                }
+            }
+        }
+
+        // Not found — create if CREATE flag is set.
+        if !flags.contains(DatabaseFlags::CREATE) {
+            return Err(Error::NotFound);
+        }
+
+        // Create a new empty DB.
+        let on_disk_flags = (flags & !DatabaseFlags::CREATE).bits() as u16;
+        let new_db = DbStat {
+            pad: 0,
+            flags: on_disk_flags,
+            depth: 0,
+            branch_pages: 0,
+            leaf_pages: 0,
+            overflow_pages: 0,
+            entries: 0,
+            root: P_INVALID,
+        };
+
+        let dbi = self.register_db(name, new_db, flags)?;
+
+        // Write the new DB record to MAIN_DBI.
+        self.write_db_record(name, &new_db)?;
+
+        Ok(dbi)
+    }
+
+    /// Register a named database in the environment's tracking structures.
+    ///
+    /// If the name is already registered, reuses the existing slot and updates
+    /// the local `dbs` array with the provided `DbStat`.
+    fn register_db(&mut self, name: &str, db: DbStat, _flags: DatabaseFlags) -> Result<u32> {
+        // Check if already registered — reuse the existing slot.
+        {
+            let db_names = self.env.db_names.read().map_err(|_| Error::Panic)?;
+            for (i, n) in db_names.iter().enumerate() {
+                if let Some(n) = n {
+                    if n == name {
+                        while self.dbs.len() <= i {
+                            self.dbs.push(DbStat::default());
+                            self.db_dirty.push(false);
+                        }
+                        self.dbs[i] = db;
+                        self.db_dirty[i] = true;
+                        return Ok(i as u32);
+                    }
+                }
+            }
+        }
+
+        let dbi = {
+            let db_names = self.env.db_names.read().map_err(|_| Error::Panic)?;
+            // Check max_dbs limit (total slots = CORE_DBS + max_dbs).
+            let max_total = CORE_DBS as usize + self.env.max_dbs as usize;
+            if db_names.len() >= max_total {
+                // Check if there's a free slot.
+                let mut free_slot = None;
+                for (i, n) in db_names.iter().enumerate().skip(CORE_DBS as usize) {
+                    if n.is_none() {
+                        free_slot = Some(i);
+                        break;
+                    }
+                }
+                if let Some(slot) = free_slot {
+                    slot
+                } else {
+                    return Err(Error::DbsFull);
+                }
+            } else {
+                db_names.len()
+            }
+        };
+
+        // Register in environment.
+        let mut db_names = self.env.db_names.write().map_err(|_| Error::Panic)?;
+        let mut db_cmp = self.env.db_cmp.write().map_err(|_| Error::Panic)?;
+        let mut db_dcmp = self.env.db_dcmp.write().map_err(|_| Error::Panic)?;
+        let mut db_flags_vec = self.env.db_flags.write().map_err(|_| Error::Panic)?;
+
+        while db_names.len() <= dbi {
+            db_names.push(None);
+            db_cmp.push(Arc::new(default_cmp(0)));
+            db_dcmp.push(Arc::new(default_dcmp(0)));
+            db_flags_vec.push(0);
+        }
+
+        db_names[dbi] = Some(name.to_string());
+        db_cmp[dbi] = Arc::new(default_cmp(db.flags));
+        db_dcmp[dbi] = Arc::new(default_dcmp(db.flags));
+        db_flags_vec[dbi] = db.flags;
+
+        // Ensure our local dbs/db_dirty arrays are large enough.
+        while self.dbs.len() <= dbi {
+            self.dbs.push(DbStat::default());
+            self.db_dirty.push(false);
+        }
+        self.dbs[dbi] = db;
+        self.db_dirty[dbi] = true;
+
+        Ok(dbi as u32)
+    }
+
+    /// Write a named database record into MAIN_DBI with `SUBDATA` node flags.
+    fn write_db_record(&mut self, name: &str, db: &DbStat) -> Result<()> {
+        let db_bytes = db_stat_to_bytes(db);
+        btree::cursor_put_with_flags(
+            self,
+            MAIN_DBI as u32,
+            name.as_bytes(),
+            &db_bytes,
+            WriteFlags::empty(),
+            NodeFlags::SUBDATA,
+        )
+    }
+
+    /// Return the name of a named database by DBI index.
+    fn get_db_name(&self, dbi: usize) -> Option<String> {
+        let db_names = self.env.db_names.read().ok()?;
+        db_names.get(dbi).and_then(|n| n.clone())
+    }
+
     /// Insert a key/value pair into the specified database.
     ///
     /// Handles page splits automatically when a leaf page is full.
@@ -399,6 +564,9 @@ impl<'env> RwTransaction<'env> {
         }
         self.finished = true;
 
+        // Write dirty named DB records back to MAIN_DBI before flushing.
+        self.flush_named_dbs()?;
+
         if self.dirty.is_empty() {
             return Ok(());
         }
@@ -434,6 +602,37 @@ impl<'env> RwTransaction<'env> {
     // -----------------------------------------------------------------------
     // Private commit helpers
     // -----------------------------------------------------------------------
+
+    /// Flush dirty named database records back to MAIN_DBI.
+    ///
+    /// For each named database that was modified during this transaction,
+    /// writes its updated `DbStat` record into MAIN_DBI with the `SUBDATA`
+    /// node flag.
+    fn flush_named_dbs(&mut self) -> Result<()> {
+        // Collect the list of dirty named DBs that need flushing.
+        let mut to_flush: Vec<(String, DbStat)> = Vec::new();
+        for dbi in CORE_DBS as usize..self.dbs.len() {
+            if self.db_dirty.get(dbi).copied().unwrap_or(false) {
+                if let Some(name) = self.get_db_name(dbi) {
+                    to_flush.push((name, self.dbs[dbi]));
+                }
+            }
+        }
+
+        for (name, db) in &to_flush {
+            let db_bytes = db_stat_to_bytes(db);
+            btree::cursor_put_with_flags(
+                self,
+                MAIN_DBI as u32,
+                name.as_bytes(),
+                &db_bytes,
+                WriteFlags::empty(),
+                NodeFlags::SUBDATA,
+            )?;
+        }
+
+        Ok(())
+    }
 
     /// Write all dirty pages to the data file via `pwrite`.
     fn flush_dirty_pages(&self) -> Result<()> {
@@ -523,6 +722,26 @@ impl<'env> RwTransaction<'env> {
 
         Ok(())
     }
+}
+
+/// Serialize a `DbStat` to its on-disk byte representation.
+///
+/// # Safety
+///
+/// `DbStat` is `repr(C)` with a known 48-byte layout. The returned array
+/// is a copy of the struct's raw bytes in native byte order (which matches
+/// the on-disk format on little-endian platforms).
+fn db_stat_to_bytes(db: &DbStat) -> [u8; std::mem::size_of::<DbStat>()] {
+    let mut buf = [0u8; std::mem::size_of::<DbStat>()];
+    // SAFETY: DbStat is repr(C) and we copy exactly size_of::<DbStat>() bytes.
+    let src = unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::from_ref(db).cast::<u8>(),
+            std::mem::size_of::<DbStat>(),
+        )
+    };
+    buf.copy_from_slice(src);
+    buf
 }
 
 impl Drop for RwTransaction<'_> {
@@ -845,5 +1064,249 @@ mod tests {
         assert_eq!(val, b"val");
 
         txn.commit().expect("commit");
+    }
+
+    // -----------------------------------------------------------------------
+    // Named database tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_create_and_use_named_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        // Create and write to a named database.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(Some("mydb"), DatabaseFlags::CREATE)
+                .expect("open_db");
+            txn.put(dbi, b"hello", b"named-world", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        // Read from the named database.
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("mydb")).expect("open_db ro");
+            let val = txn.get(dbi, b"hello").expect("get");
+            assert_eq!(val, b"named-world");
+        }
+    }
+
+    #[test]
+    fn test_should_support_multiple_named_dbs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        // Create two named databases and write different data to each.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let db_a = txn
+                .open_db(Some("db_a"), DatabaseFlags::CREATE)
+                .expect("open db_a");
+            let db_b = txn
+                .open_db(Some("db_b"), DatabaseFlags::CREATE)
+                .expect("open db_b");
+
+            txn.put(db_a, b"key", b"value-A", WriteFlags::empty())
+                .expect("put A");
+            txn.put(db_b, b"key", b"value-B", WriteFlags::empty())
+                .expect("put B");
+            txn.commit().expect("commit");
+        }
+
+        // Read from both and verify data is independent.
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let db_a = txn.open_db(Some("db_a")).expect("open db_a ro");
+            let db_b = txn.open_db(Some("db_b")).expect("open db_b ro");
+
+            assert_eq!(txn.get(db_a, b"key").expect("get A"), b"value-A");
+            assert_eq!(txn.get(db_b, b"key").expect("get B"), b"value-B");
+        }
+    }
+
+    #[test]
+    fn test_should_persist_named_db_across_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Write to a named database.
+        {
+            let env = Environment::builder()
+                .map_size(10 * 1024 * 1024)
+                .max_dbs(4)
+                .open(dir.path())
+                .expect("open");
+
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(Some("persist"), DatabaseFlags::CREATE)
+                .expect("open_db");
+            txn.put(dbi, b"durable", b"data", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        // Reopen the environment and read back.
+        {
+            let env = Environment::builder()
+                .map_size(10 * 1024 * 1024)
+                .max_dbs(4)
+                .open(dir.path())
+                .expect("reopen");
+
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("persist")).expect("open_db ro");
+            let val = txn.get(dbi, b"durable").expect("get");
+            assert_eq!(val, b"data");
+        }
+    }
+
+    #[test]
+    fn test_should_return_not_found_for_nonexistent_named_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        // Try to open a named DB without CREATE.
+        let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+        let result = txn.open_db(Some("nope"), DatabaseFlags::empty());
+        assert!(
+            matches!(result, Err(Error::NotFound)),
+            "expected NotFound, got {result:?}",
+        );
+        txn.abort();
+    }
+
+    #[test]
+    fn test_should_return_bad_dbi_without_max_dbs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .max_dbs(0) // no named databases configured
+            .open(dir.path())
+            .expect("open");
+
+        let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+        let result = txn.open_db(Some("fail"), DatabaseFlags::CREATE);
+        assert!(
+            matches!(result, Err(Error::BadDbi)),
+            "expected BadDbi, got {result:?}",
+        );
+        txn.abort();
+    }
+
+    #[test]
+    fn test_should_see_consistent_snapshot_with_sequential_txns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        // Create named DB and write initial data.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(Some("snapshot_db"), DatabaseFlags::CREATE)
+                .expect("open_db");
+            txn.put(dbi, b"version", b"1", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        // Start a read transaction (sees version 1).
+        let ro_txn = env.begin_ro_txn().expect("begin_ro_txn");
+
+        // Write new data in a write transaction.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(Some("snapshot_db"), DatabaseFlags::CREATE)
+                .expect("open_db");
+            txn.put(dbi, b"version", b"2", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        // A new read transaction should see the latest data.
+        {
+            let mut ro_txn2 = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = ro_txn2.open_db(Some("snapshot_db")).expect("open_db ro");
+            let val = ro_txn2.get(dbi, b"version").expect("get");
+            assert_eq!(val, b"2");
+        }
+
+        drop(ro_txn);
+    }
+
+    #[test]
+    fn test_should_write_many_keys_to_named_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(64 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        // Write many keys to a named DB to exercise page splits.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(Some("bigdb"), DatabaseFlags::CREATE)
+                .expect("open_db");
+            for i in 0..200u32 {
+                let key = format!("nk-{i:06}");
+                let val = format!("nv-{i:06}");
+                txn.put(dbi, key.as_bytes(), val.as_bytes(), WriteFlags::empty())
+                    .unwrap_or_else(|e| panic!("put {key}: {e}"));
+            }
+            txn.commit().expect("commit");
+        }
+
+        // Verify all keys.
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("bigdb")).expect("open_db ro");
+            for i in 0..200u32 {
+                let key = format!("nk-{i:06}");
+                let val = format!("nv-{i:06}");
+                let got = txn
+                    .get(dbi, key.as_bytes())
+                    .unwrap_or_else(|e| panic!("get {key}: {e}"));
+                assert_eq!(got, val.as_bytes(), "mismatch for {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_should_open_default_db_with_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+        let dbi = txn
+            .open_db(None, DatabaseFlags::empty())
+            .expect("open_db None");
+        assert_eq!(dbi, MAIN_DBI as u32);
+        txn.abort();
     }
 }

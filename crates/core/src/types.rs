@@ -162,9 +162,12 @@ pub struct Meta {
 }
 
 bitflags! {
-    /// Database flags stored in `DbStat.flags` (on-disk, u16).
+    /// Database flags for `open_db`.
+    ///
+    /// The lower 16 bits match the on-disk `DbStat.flags` (u16).
+    /// `CREATE` is an open-time-only flag and is not stored on disk.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct DatabaseFlags: u16 {
+    pub struct DatabaseFlags: u32 {
         /// Compare keys in reverse byte order.
         const REVERSE_KEY  = 0x02;
         /// Allow duplicate keys with sorted data items.
@@ -177,6 +180,8 @@ bitflags! {
         const INTEGER_DUP  = 0x20;
         /// With `DUP_SORT`: compare dup data in reverse byte order.
         const REVERSE_DUP  = 0x40;
+        /// Create the database if it doesn't exist (open-time only).
+        const CREATE       = 0x40000;
     }
 }
 

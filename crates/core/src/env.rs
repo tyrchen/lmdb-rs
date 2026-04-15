@@ -628,6 +628,46 @@ impl Environment {
         self.inner.flags
     }
 
+    /// Sync the data file to disk.
+    ///
+    /// If `force` is true, a synchronous flush is performed even when
+    /// `NO_SYNC` is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the sync fails.
+    pub fn sync(&self, force: bool) -> Result<()> {
+        if !force && self.inner.flags.contains(EnvFlags::NO_SYNC) {
+            return Ok(());
+        }
+        let fd = self.inner.data_fd();
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: fd is a valid file descriptor.
+            let ret = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
+            if ret < 0 {
+                return Err(Error::Io(std::io::Error::last_os_error()));
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // SAFETY: fd is a valid file descriptor.
+            let ret = unsafe { libc::fdatasync(fd) };
+            if ret < 0 {
+                return Err(Error::Io(std::io::Error::last_os_error()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Check for stale readers and return the number cleared.
+    ///
+    /// This is currently a stub that always returns 0. Full reader-table
+    /// management will be implemented in a future phase.
+    pub fn check_readers(&self) -> Result<u32> {
+        Ok(0)
+    }
+
     /// Access the shared inner state (for internal use by transactions).
     #[allow(dead_code)] // Used in later phases
     pub(crate) fn inner(&self) -> &Arc<EnvironmentInner> {

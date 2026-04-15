@@ -96,6 +96,106 @@ impl<'env> RoTransaction<'env> {
         Ok(RoCursor { txn: self, cursor })
     }
 
+    /// Open a named database for read-only access.
+    ///
+    /// If `name` is `None`, returns the handle for the default (main) database.
+    /// If `name` is `Some`, looks up the named database in the main database.
+    /// Named databases must have been previously created by a write transaction.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if the named database does not exist
+    /// - [`Error::BadDbi`] if the environment was not configured with `max_dbs > 0`
+    pub fn open_db(&mut self, name: Option<&str>) -> Result<u32> {
+        if let Some(name) = name {
+            if self.env.max_dbs == 0 {
+                return Err(Error::BadDbi);
+            }
+            self.find_db(name)
+        } else {
+            Ok(MAIN_DBI)
+        }
+    }
+
+    /// Look up a named database in MAIN_DBI (read-only, no creation).
+    fn find_db(&mut self, name: &str) -> Result<u32> {
+        // Always search MAIN_DBI to get the current DbStat, then check
+        // if it's already registered.
+        let main_db = self.dbs[MAIN_DBI as usize];
+        if main_db.root == P_INVALID {
+            return Err(Error::NotFound);
+        }
+
+        let cmp = self.env.get_cmp(MAIN_DBI)?;
+        let mut cursor = Cursor::new(self.env.page_size, MAIN_DBI);
+        let get_page = |pgno: u64| self.env.get_page(pgno);
+
+        cursor.page_search(main_db.root, Some(name.as_bytes()), &*cmp, &get_page)?;
+
+        let node = cursor.current_node().ok_or(Error::NotFound)?;
+        if cmp(name.as_bytes(), node.key()) != Ordering::Equal || !node.is_subdata() {
+            return Err(Error::NotFound);
+        }
+
+        let db_stat = node.sub_db();
+
+        // Check if already registered in the environment.
+        {
+            let db_names = self.env.db_names.read().map_err(|_| Error::Panic)?;
+            for (i, n) in db_names.iter().enumerate() {
+                if let Some(n) = n {
+                    if n == name {
+                        // Already registered — update our local dbs array.
+                        while self.dbs.len() <= i {
+                            self.dbs.push(DbStat::default());
+                        }
+                        self.dbs[i] = db_stat;
+                        return Ok(i as u32);
+                    }
+                }
+            }
+        }
+
+        self.register_db_ro(name, db_stat)
+    }
+
+    /// Register a named database for read-only access.
+    fn register_db_ro(&mut self, name: &str, db: DbStat) -> Result<u32> {
+        use std::sync::Arc;
+
+        use crate::cmp::{default_cmp, default_dcmp};
+
+        let dbi = {
+            let db_names = self.env.db_names.read().map_err(|_| Error::Panic)?;
+            db_names.len()
+        };
+
+        let mut db_names = self.env.db_names.write().map_err(|_| Error::Panic)?;
+        let mut db_cmp = self.env.db_cmp.write().map_err(|_| Error::Panic)?;
+        let mut db_dcmp = self.env.db_dcmp.write().map_err(|_| Error::Panic)?;
+        let mut db_flags_vec = self.env.db_flags.write().map_err(|_| Error::Panic)?;
+
+        while db_names.len() <= dbi {
+            db_names.push(None);
+            db_cmp.push(Arc::new(default_cmp(0)));
+            db_dcmp.push(Arc::new(default_dcmp(0)));
+            db_flags_vec.push(0);
+        }
+
+        db_names[dbi] = Some(name.to_string());
+        db_cmp[dbi] = Arc::new(default_cmp(db.flags));
+        db_dcmp[dbi] = Arc::new(default_dcmp(db.flags));
+        db_flags_vec[dbi] = db.flags;
+
+        // Extend local dbs array.
+        while self.dbs.len() <= dbi {
+            self.dbs.push(DbStat::default());
+        }
+        self.dbs[dbi] = db;
+
+        Ok(dbi as u32)
+    }
+
     /// Return the transaction ID.
     #[must_use]
     pub fn txnid(&self) -> u64 {

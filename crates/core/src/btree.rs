@@ -73,6 +73,27 @@ pub fn cursor_put(
     data: &[u8],
     flags: WriteFlags,
 ) -> Result<()> {
+    cursor_put_with_flags(txn, dbi, key, data, flags, NodeFlags::empty())
+}
+
+/// Insert a key/value pair with explicit node flags, splitting pages as needed.
+///
+/// This variant allows specifying node-level flags (e.g., `SUBDATA` for named
+/// database records). See [`cursor_put`] for the general-purpose version.
+///
+/// # Errors
+///
+/// - [`Error::BadValSize`] if key is empty or exceeds the maximum key size
+/// - [`Error::KeyExist`] if `NO_OVERWRITE` is set and the key already exists
+/// - [`Error::MapFull`] if no more pages can be allocated
+pub fn cursor_put_with_flags(
+    txn: &mut RwTransaction<'_>,
+    dbi: u32,
+    key: &[u8],
+    data: &[u8],
+    flags: WriteFlags,
+    node_flags: NodeFlags,
+) -> Result<()> {
     if key.is_empty() || key.len() > txn.env.max_key_size {
         return Err(Error::BadValSize);
     }
@@ -96,7 +117,7 @@ pub fn cursor_put(
             key,
             data,
             0,
-            NodeFlags::empty(),
+            node_flags,
         )?;
         txn.dirty.insert(root_pgno, root_buf);
 
@@ -144,7 +165,7 @@ pub fn cursor_put(
         key,
         data,
         0,
-        NodeFlags::empty(),
+        node_flags,
     );
 
     match add_result {
@@ -160,16 +181,7 @@ pub fn cursor_put(
         }
         Err(Error::PageFull) => {
             // The leaf is full -- split and insert.
-            split_and_insert(
-                txn,
-                dbi,
-                &path,
-                key,
-                data,
-                NodeFlags::empty(),
-                insert_idx,
-                &**cmp,
-            )?;
+            split_and_insert(txn, dbi, &path, key, data, node_flags, insert_idx, &**cmp)?;
             let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
             if !overwrite {
                 db_mut.entries += 1;
