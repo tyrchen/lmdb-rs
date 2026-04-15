@@ -32,7 +32,7 @@ use crate::{
     cmp::{CmpFn, default_cmp, default_dcmp},
     error::{Error, Result},
     page::Page,
-    types::{DbStat, MDB_DATA_VERSION, MDB_MAGIC, Meta, P_INVALID, PAGE_HEADER_SIZE},
+    types::{DbStat, MDB_DATA_VERSION, MDB_MAGIC, Meta, P_INVALID, PAGE_HEADER_SIZE, PageFlags},
 };
 
 // ---------------------------------------------------------------------------
@@ -280,10 +280,12 @@ pub(crate) struct EnvironmentInner {
     pub(crate) db_names: RwLock<Vec<Option<String>>>,
     /// Per-database flags.
     pub(crate) db_flags: RwLock<Vec<u16>>,
-    /// Writer mutex — only one write transaction at a time.
+    /// Writer mutex — only one write transaction at a time (in-process).
     pub(crate) write_mutex: Mutex<()>,
     /// In-process reader table tracking active read transaction snapshots.
     pub(crate) reader_table: ReaderTable,
+    /// Lock file for cross-process writer serialization.
+    pub(crate) lock_file: Option<File>,
 }
 
 // SAFETY: The raw mmap pointer is only accessed through methods that uphold
@@ -399,6 +401,21 @@ impl EnvironmentInner {
     pub(crate) fn data_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
         self._data_file.as_raw_fd()
+    }
+
+    /// Return the raw mmap pointer (for WRITEMAP mode).
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the exclusive writer lock and ensure the mmap
+    /// was created with write permissions (WRITE_MAP flag).
+    pub(crate) fn mmap_mut_ptr(&self) -> *mut u8 {
+        self.mmap.as_mut_ptr()
+    }
+
+    /// Return the mmap size in bytes.
+    pub(crate) fn mmap_len(&self) -> usize {
+        self.map_size
     }
 }
 
@@ -539,12 +556,40 @@ impl Environment {
         let total_dbs = CORE_DBS + config.max_dbs;
 
         // ------------------------------------------------------------------
+        // 6a. Open/create the lock file for cross-process writer locking
+        // ------------------------------------------------------------------
+        let lock_file = if !config.flags.contains(EnvFlags::NO_LOCK) && !read_only {
+            let lock_path = if config.flags.contains(EnvFlags::NO_SUB_DIR) {
+                format!("{}-lock", data_path.display())
+            } else {
+                path.join("lock.mdb").to_string_lossy().to_string()
+            };
+            Some(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&lock_path)?,
+            )
+        } else {
+            None
+        };
+
+        // ------------------------------------------------------------------
         // 6. Memory-map the data file
         // ------------------------------------------------------------------
-        let mmap = MmapOptions::new()
-            .len(map_size)
-            .map_raw(&data_file)
-            .map_err(Error::Io)?;
+        let mmap = if read_only {
+            MmapOptions::new()
+                .len(map_size)
+                .map_raw_read_only(&data_file)
+                .map_err(Error::Io)?
+        } else {
+            MmapOptions::new()
+                .len(map_size)
+                .map_raw(&data_file)
+                .map_err(Error::Io)?
+        };
 
         // ------------------------------------------------------------------
         // 7. Initialise per-database comparison functions
@@ -597,6 +642,7 @@ impl Environment {
             db_flags: RwLock::new(flags_vec),
             write_mutex: Mutex::new(()),
             reader_table: ReaderTable::new(config.max_readers),
+            lock_file,
         };
 
         Ok(Self {
@@ -743,6 +789,279 @@ impl Environment {
     #[allow(dead_code)] // Used in later phases
     pub(crate) fn inner(&self) -> &Arc<EnvironmentInner> {
         &self.inner
+    }
+
+    /// Create a compacting copy of the database.
+    ///
+    /// Walks the B+ tree depth-first, assigns new sequential page numbers,
+    /// and writes the pages out with updated child pointers. Free pages are
+    /// eliminated, producing a minimal output file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if file operations fail.
+    pub fn copy_compact<P: AsRef<Path>>(&self, dest: P) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write as IoWrite};
+
+        let _txn = self.begin_ro_txn()?;
+        let meta = self.inner.meta();
+        let page_size = self.inner.page_size;
+
+        let mut file = fs::File::create(dest.as_ref())?;
+
+        // Map old page numbers to new sequential page numbers.
+        let mut pgno_map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        let mut next_pgno = NUM_METAS as u64; // Skip meta pages 0 and 1.
+        let mut pages_out: Vec<(u64, Vec<u8>)> = Vec::new(); // (new_pgno, page_data)
+
+        let main_root = meta.dbs[MAIN_DBI as usize].root;
+        let free_root = meta.dbs[FREE_DBI as usize].root;
+
+        // Walk FREE_DBI tree (we include it for correctness, but it will be
+        // empty in the compacted output since all pages are renumbered).
+        // Actually, for compacting copy, we skip the free list entirely
+        // since the compacted file has no free pages.
+
+        // Walk MAIN_DBI tree depth-first.
+        if main_root != P_INVALID {
+            self.walk_tree_compact(
+                main_root,
+                page_size,
+                &mut pgno_map,
+                &mut next_pgno,
+                &mut pages_out,
+            )?;
+        }
+
+        // Also walk FREE_DBI so we don't lose its structure if non-empty.
+        // For a compacting copy, the free list should be empty.
+        // We skip it intentionally.
+        let _ = free_root;
+
+        // Fix up page pointers to use new page numbers.
+        // We collect fixups first, then apply them, to avoid borrow conflicts.
+        for (_, page_data) in &mut pages_out {
+            let mut fixups: Vec<(usize, Vec<u8>)> = Vec::new();
+            {
+                let page = Page::from_raw(page_data);
+                if page.is_branch() {
+                    let nkeys = page.num_keys();
+                    for i in 0..nkeys {
+                        let node_offset = page.ptr_at(i) as usize;
+                        let lo = u16::from_le_bytes([
+                            page_data[node_offset],
+                            page_data[node_offset + 1],
+                        ]);
+                        let hi = u16::from_le_bytes([
+                            page_data[node_offset + 2],
+                            page_data[node_offset + 3],
+                        ]);
+                        let flags_raw = u16::from_le_bytes([
+                            page_data[node_offset + 4],
+                            page_data[node_offset + 5],
+                        ]);
+                        let old_child =
+                            u64::from(lo) | (u64::from(hi) << 16) | (u64::from(flags_raw) << 32);
+
+                        if let Some(&new_child) = pgno_map.get(&old_child) {
+                            let new_lo = (new_child & 0xFFFF) as u16;
+                            let new_hi = ((new_child >> 16) & 0xFFFF) as u16;
+                            let new_flags = ((new_child >> 32) & 0xFFFF) as u16;
+                            let mut bytes = Vec::with_capacity(6);
+                            bytes.extend_from_slice(&new_lo.to_le_bytes());
+                            bytes.extend_from_slice(&new_hi.to_le_bytes());
+                            bytes.extend_from_slice(&new_flags.to_le_bytes());
+                            fixups.push((node_offset, bytes));
+                        }
+                    }
+                } else if page.is_leaf() && !page.is_leaf2() {
+                    let nkeys = page.num_keys();
+                    for i in 0..nkeys {
+                        let node_offset = page.ptr_at(i) as usize;
+                        let node_flags_raw = u16::from_le_bytes([
+                            page_data[node_offset + 4],
+                            page_data[node_offset + 5],
+                        ]);
+                        let is_bigdata = node_flags_raw & 0x01 != 0;
+                        let is_subdata = node_flags_raw & 0x02 != 0;
+                        let key_size = u16::from_le_bytes([
+                            page_data[node_offset + 6],
+                            page_data[node_offset + 7],
+                        ]) as usize;
+                        let data_offset = node_offset + 8 + key_size;
+
+                        if is_bigdata && data_offset + 8 <= page_data.len() {
+                            let mut old_pgno_bytes = [0u8; 8];
+                            old_pgno_bytes
+                                .copy_from_slice(&page_data[data_offset..data_offset + 8]);
+                            let old_ovf_pgno = u64::from_le_bytes(old_pgno_bytes);
+                            if let Some(&new_ovf_pgno) = pgno_map.get(&old_ovf_pgno) {
+                                fixups.push((data_offset, new_ovf_pgno.to_le_bytes().to_vec()));
+                            }
+                        }
+
+                        if is_subdata
+                            && data_offset + std::mem::size_of::<crate::types::DbStat>()
+                                <= page_data.len()
+                        {
+                            // DbStat.root is at offset 40 within the struct.
+                            let root_offset = data_offset + 40;
+                            if root_offset + 8 <= page_data.len() {
+                                let mut old_root_bytes = [0u8; 8];
+                                old_root_bytes
+                                    .copy_from_slice(&page_data[root_offset..root_offset + 8]);
+                                let old_root = u64::from_le_bytes(old_root_bytes);
+                                if old_root != P_INVALID {
+                                    if let Some(&new_root) = pgno_map.get(&old_root) {
+                                        fixups.push((root_offset, new_root.to_le_bytes().to_vec()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Apply collected fixups.
+            for (offset, bytes) in fixups {
+                page_data[offset..offset + bytes.len()].copy_from_slice(&bytes);
+            }
+        }
+
+        // Write meta pages.
+        let new_main_root = if main_root != P_INVALID {
+            pgno_map.get(&main_root).copied().unwrap_or(P_INVALID)
+        } else {
+            P_INVALID
+        };
+
+        // The output file size is next_pgno * page_size.
+        let output_size = next_pgno as usize * page_size;
+        let compact_map_size = if output_size > 0 {
+            output_size
+        } else {
+            NUM_METAS * page_size
+        };
+
+        let new_meta = Meta {
+            magic: MDB_MAGIC,
+            version: MDB_DATA_VERSION,
+            address: 0,
+            map_size: compact_map_size as u64,
+            dbs: [
+                empty_free_dbstat(page_size as u32),
+                crate::types::DbStat {
+                    root: new_main_root,
+                    ..meta.dbs[MAIN_DBI as usize]
+                },
+            ],
+            last_pgno: if next_pgno > 0 {
+                next_pgno - 1
+            } else {
+                NUM_METAS as u64 - 1
+            },
+            txnid: meta.txnid,
+        };
+
+        write_initial_meta(&file, page_size, &new_meta)?;
+
+        // Ensure the file is large enough for all pages.
+        file.set_len(compact_map_size as u64)?;
+
+        // Write all renumbered pages.
+        for (new_pgno, page_data) in &pages_out {
+            let offset = *new_pgno * page_size as u64;
+            file.seek(SeekFrom::Start(offset))?;
+
+            // Update the page number in the page header.
+            let mut data = page_data.clone();
+            data[0..8].copy_from_slice(&new_pgno.to_le_bytes());
+            // Clear DIRTY flag.
+            let flags_raw = u16::from_le_bytes([data[10], data[11]]);
+            let clean_flags = flags_raw & !PageFlags::DIRTY.bits();
+            data[10..12].copy_from_slice(&clean_flags.to_le_bytes());
+
+            file.write_all(&data)?;
+        }
+
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Walk a B+ tree depth-first, collecting all reachable pages and assigning
+    /// new sequential page numbers.
+    fn walk_tree_compact(
+        &self,
+        pgno: u64,
+        page_size: usize,
+        pgno_map: &mut std::collections::HashMap<u64, u64>,
+        next_pgno: &mut u64,
+        pages_out: &mut Vec<(u64, Vec<u8>)>,
+    ) -> Result<()> {
+        if pgno == P_INVALID || pgno_map.contains_key(&pgno) {
+            return Ok(());
+        }
+
+        let ptr = self.inner.get_page(pgno)?;
+        let page_data = unsafe { std::slice::from_raw_parts(ptr, page_size) };
+        let page = Page::from_raw(page_data);
+
+        if page.is_overflow() {
+            // Overflow page: copy all contiguous pages.
+            let num_pages = page.overflow_pages() as usize;
+            let total_size = num_pages * page_size;
+            let all_data = unsafe { std::slice::from_raw_parts(ptr, total_size) };
+
+            let new_pgno = *next_pgno;
+            pgno_map.insert(pgno, new_pgno);
+            *next_pgno += num_pages as u64;
+
+            // Map intermediate pages too.
+            for i in 1..num_pages as u64 {
+                pgno_map.insert(pgno + i, new_pgno + i);
+            }
+
+            pages_out.push((new_pgno, all_data.to_vec()));
+            return Ok(());
+        }
+
+        if page.is_branch() {
+            // Recurse into children first (depth-first).
+            let nkeys = page.num_keys();
+            for i in 0..nkeys {
+                let child_pgno = page.node(i).child_pgno();
+                self.walk_tree_compact(child_pgno, page_size, pgno_map, next_pgno, pages_out)?;
+            }
+        } else if page.is_leaf() && !page.is_leaf2() {
+            // Check for overflow pages and sub-database roots.
+            let nkeys = page.num_keys();
+            for i in 0..nkeys {
+                let node = page.node(i);
+                if node.is_bigdata() {
+                    let ovf_pgno = node.overflow_pgno();
+                    self.walk_tree_compact(ovf_pgno, page_size, pgno_map, next_pgno, pages_out)?;
+                }
+                if node.is_subdata() {
+                    let sub_db = node.sub_db();
+                    if sub_db.root != P_INVALID {
+                        self.walk_tree_compact(
+                            sub_db.root,
+                            page_size,
+                            pgno_map,
+                            next_pgno,
+                            pages_out,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // Assign new page number for this page.
+        let new_pgno = *next_pgno;
+        pgno_map.insert(pgno, new_pgno);
+        *next_pgno += 1;
+        pages_out.push((new_pgno, page_data.to_vec()));
+
+        Ok(())
     }
 }
 
@@ -931,5 +1250,129 @@ mod tests {
         assert!(stat.page_size > 0);
         let info = env.info();
         assert_eq!(info.map_size, 1024 * 1024);
+    }
+
+    // -------------------------------------------------------------------
+    // Feature: Compacting copy
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_should_compact_copy_empty_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let dest_dir = tempfile::tempdir().expect("dest_dir");
+        let dest = dest_dir.path().join("compact.mdb");
+        env.copy_compact(&dest).expect("copy_compact");
+        assert!(dest.exists(), "compacted file should exist");
+
+        // Drop the source env to release the lock file.
+        drop(env);
+
+        // Open the compacted copy.
+        let file_len = std::fs::metadata(&dest).expect("meta").len() as usize;
+        let env2 = Environment::builder()
+            .map_size(file_len)
+            .flags(EnvFlags::NO_SUB_DIR | EnvFlags::READ_ONLY)
+            .open(&dest)
+            .expect("open compact");
+        let stat = env2.stat().expect("stat");
+        assert_eq!(stat.entries, 0);
+    }
+
+    #[test]
+    fn test_should_compact_copy_with_data() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(2 * 1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        // Insert data.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..100 {
+                let key = format!("key_{i:04}");
+                let val = format!("val_{i:04}");
+                txn.put(
+                    MAIN_DBI as u32,
+                    key.as_bytes(),
+                    val.as_bytes(),
+                    crate::types::WriteFlags::empty(),
+                )
+                .expect("put");
+            }
+            txn.commit().expect("commit");
+        }
+
+        let dest = dir.path().join("compact.mdb");
+        env.copy_compact(&dest).expect("copy_compact");
+
+        // Open the compacted copy. Use file size as map_size to avoid SIGBUS.
+        let file_len = std::fs::metadata(&dest).expect("meta").len() as usize;
+        let env2 = Environment::builder()
+            .map_size(file_len)
+            .flags(EnvFlags::NO_SUB_DIR | EnvFlags::READ_ONLY)
+            .open(&dest)
+            .expect("open compact");
+
+        let txn = env2.begin_ro_txn().expect("begin_ro_txn");
+        for i in 0..100 {
+            let key = format!("key_{i:04}");
+            let expected = format!("val_{i:04}");
+            let val = txn.get(MAIN_DBI as u32, key.as_bytes()).expect("get");
+            assert_eq!(val, expected.as_bytes(), "mismatch for {key}");
+        }
+    }
+
+    #[test]
+    fn test_should_compact_copy_smaller_than_plain_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(2 * 1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        // Insert and then delete half the data to create free pages.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..200 {
+                let key = format!("key_{i:04}");
+                let val = format!("val_{i:04}");
+                txn.put(
+                    MAIN_DBI as u32,
+                    key.as_bytes(),
+                    val.as_bytes(),
+                    crate::types::WriteFlags::empty(),
+                )
+                .expect("put");
+            }
+            txn.commit().expect("commit");
+        }
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..100 {
+                let key = format!("key_{i:04}");
+                txn.del(MAIN_DBI as u32, key.as_bytes(), None).expect("del");
+            }
+            txn.commit().expect("commit");
+        }
+
+        let plain_dest = dir.path().join("plain.mdb");
+        env.copy(&plain_dest).expect("copy");
+
+        let compact_dest = dir.path().join("compact.mdb");
+        env.copy_compact(&compact_dest).expect("copy_compact");
+
+        let plain_size = std::fs::metadata(&plain_dest).expect("meta").len();
+        let compact_size = std::fs::metadata(&compact_dest).expect("meta").len();
+
+        assert!(
+            compact_size <= plain_size,
+            "compact ({compact_size}) should be <= plain ({plain_size})",
+        );
     }
 }

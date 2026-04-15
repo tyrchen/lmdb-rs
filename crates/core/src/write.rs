@@ -273,6 +273,18 @@ impl<'env> RwTransaction<'env> {
     pub(crate) fn new(env: &'env EnvironmentInner) -> Result<Self> {
         // Acquire writer lock — held for the entire transaction lifetime.
         let write_guard = env.write_mutex.lock().map_err(|_| Error::Panic)?;
+
+        // Acquire cross-process file lock (exclusive, blocking).
+        if let Some(ref lock_file) = env.lock_file {
+            use std::os::fd::AsRawFd;
+            let fd = lock_file.as_raw_fd();
+            // SAFETY: fd is a valid file descriptor from the lock file.
+            let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if rc != 0 {
+                return Err(Error::Io(std::io::Error::last_os_error()));
+            }
+        }
+
         let meta = env.meta();
         let txnid = meta.txnid + 1;
         let next_pgno = meta.last_pgno + 1;
@@ -576,6 +588,114 @@ impl<'env> RwTransaction<'env> {
     /// - [`Error::MapFull`] if no more pages can be allocated
     pub fn put(&mut self, dbi: u32, key: &[u8], data: &[u8], flags: WriteFlags) -> Result<()> {
         btree::cursor_put(self, dbi, key, data, flags)
+    }
+
+    /// Reserve space for a value and return a mutable slice to fill.
+    ///
+    /// This allows zero-copy writes: the caller writes data directly into
+    /// the dirty page buffer, avoiding a memcpy. The caller must fill the
+    /// returned slice before committing the transaction.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::BadValSize`] if key is empty or exceeds max key size
+    /// - [`Error::MapFull`] if no more pages can be allocated
+    /// - [`Error::Corrupted`] if the inserted node cannot be located
+    pub fn reserve(&mut self, dbi: u32, key: &[u8], data_len: usize) -> Result<&mut [u8]> {
+        let zeroed = vec![0u8; data_len];
+        btree::cursor_put(self, dbi, key, &zeroed, WriteFlags::RESERVE)?;
+
+        // Locate the inserted node in the dirty page to return a mutable
+        // slice pointing at its data area.
+        let db = self.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
+        if db.root == P_INVALID {
+            return Err(Error::Corrupted);
+        }
+
+        let cmp = self.env.get_cmp(dbi)?;
+        let page_size = self.env.page_size;
+
+        // Walk from root to the leaf containing the key.
+        let leaf_pgno = self.find_leaf_for_key(db.root, key, &cmp, page_size)?;
+
+        // Find the node on the leaf page.
+        let buf = self.dirty.find_mut(leaf_pgno).ok_or(Error::Corrupted)?;
+        let page = Page::from_raw(buf.as_slice());
+        let nkeys = page.num_keys();
+
+        for i in 0..nkeys {
+            let node = page.node(i);
+            if (**cmp)(key, node.key()) == Ordering::Equal {
+                // Found the node. Compute the data area offset within the page buffer.
+                let node_offset = page.ptr_at(i) as usize;
+                let key_size = u16::from_le_bytes([
+                    buf.as_slice()[node_offset + 6],
+                    buf.as_slice()[node_offset + 7],
+                ]) as usize;
+                let data_start = node_offset + NODE_HEADER_SIZE + key_size;
+                return Ok(&mut buf.as_mut_slice()[data_start..data_start + data_len]);
+            }
+        }
+
+        Err(Error::Corrupted)
+    }
+
+    /// Walk the B+ tree to find the leaf page containing the given key.
+    ///
+    /// Returns the page number of the leaf. This only reads dirty pages
+    /// and mmap pages; it does not COW.
+    fn find_leaf_for_key(
+        &self,
+        root: u64,
+        key: &[u8],
+        cmp: &Arc<Box<crate::cmp::CmpFn>>,
+        page_size: usize,
+    ) -> Result<u64> {
+        let mut current_pgno = root;
+        loop {
+            let ptr = self.get_page(current_pgno)?;
+            let slice = unsafe { std::slice::from_raw_parts(ptr, page_size) };
+            let page = Page::from_raw(slice);
+
+            if page.is_leaf() {
+                return Ok(current_pgno);
+            }
+
+            if !page.is_branch() {
+                return Err(Error::Corrupted);
+            }
+
+            let nkeys = page.num_keys();
+            if nkeys == 0 {
+                return Err(Error::Corrupted);
+            }
+
+            // Binary search skipping index 0 (implicit empty key on branch pages).
+            let mut lo = 1usize;
+            let mut hi = nkeys;
+            let mut exact = false;
+            let mut idx = 0;
+
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let node_key = page.node(mid).key();
+                match (**cmp)(key, node_key) {
+                    Ordering::Equal => {
+                        exact = true;
+                        idx = mid;
+                        break;
+                    }
+                    Ordering::Greater => lo = mid + 1,
+                    Ordering::Less => hi = mid,
+                }
+            }
+
+            if !exact {
+                idx = if lo > 0 { lo - 1 } else { 0 };
+            }
+
+            current_pgno = page.node(idx).child_pgno();
+        }
     }
 
     /// Delete a key (and optionally a specific dup value) from the database.
@@ -1056,27 +1176,82 @@ impl<'env> RwTransaction<'env> {
         Ok(())
     }
 
-    /// Write all dirty pages to the data file via `pwrite`.
+    /// Return `true` if the environment was opened with `WRITE_MAP`.
+    fn is_writemap(&self) -> bool {
+        self.env.flags.contains(EnvFlags::WRITE_MAP)
+    }
+
+    /// Write all dirty pages to the data file.
+    ///
+    /// In normal mode, uses `pwrite` to write each dirty page.
+    /// In WRITEMAP mode, copies dirty pages directly into the mmap
+    /// and then calls `msync`.
     fn flush_dirty_pages(&self) -> Result<()> {
         let page_size = self.env.page_size;
-        let fd = self.env.data_fd();
 
-        for (pgno, buf) in self.dirty.iter() {
-            let offset = *pgno as i64 * page_size as i64;
-            let data = buf.as_slice();
-            // SAFETY: fd is a valid file descriptor from the environment's
-            // data file. data points to a valid buffer for data.len() bytes.
-            let written = unsafe { libc::pwrite(fd, data.as_ptr().cast(), data.len(), offset) };
-            if written < 0 || written as usize != data.len() {
+        if self.is_writemap() {
+            // WRITEMAP: Ensure the file is large enough for all dirty pages.
+            // The mmap extends to map_size, but the file must be extended
+            // to cover pages being written (pwrite does this automatically,
+            // but mmap writes beyond the file size cause SIGBUS).
+            let needed_size = self.next_pgno as usize * page_size;
+            let fd = self.env.data_fd();
+            // SAFETY: fd is a valid file descriptor.
+            let ret = unsafe { libc::ftruncate(fd, needed_size as libc::off_t) };
+            if ret != 0 {
                 return Err(Error::Io(std::io::Error::last_os_error()));
             }
-        }
 
-        Ok(())
+            // Copy dirty pages into the mmap region.
+            for (pgno, buf) in self.dirty.iter() {
+                let offset = *pgno as usize * page_size;
+                let data = buf.as_slice();
+                // SAFETY: We hold the exclusive writer lock. The mmap is
+                // writable (WRITE_MAP). The offset is within bounds because
+                // pgno < max_pgno and the mmap covers map_size bytes.
+                let dst = unsafe { self.env.mmap_mut_ptr().add(offset) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+                }
+            }
+            // msync the dirty region.
+            // SAFETY: mmap pointer is valid for map_size bytes.
+            let rc = unsafe {
+                libc::msync(
+                    self.env.mmap_mut_ptr().cast(),
+                    self.env.map_size,
+                    libc::MS_SYNC,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::Io(std::io::Error::last_os_error()));
+            }
+            Ok(())
+        } else {
+            // Normal mode: pwrite each dirty page.
+            let fd = self.env.data_fd();
+            for (pgno, buf) in self.dirty.iter() {
+                let offset = *pgno as i64 * page_size as i64;
+                let data = buf.as_slice();
+                // SAFETY: fd is a valid file descriptor from the environment's
+                // data file. data points to a valid buffer for data.len() bytes.
+                let written = unsafe { libc::pwrite(fd, data.as_ptr().cast(), data.len(), offset) };
+                if written < 0 || written as usize != data.len() {
+                    return Err(Error::Io(std::io::Error::last_os_error()));
+                }
+            }
+            Ok(())
+        }
     }
 
     /// Sync the data file to disk.
+    ///
+    /// In WRITEMAP mode, `msync` is called during page flush and meta write,
+    /// so this is a no-op.
     fn sync_data(&self) -> Result<()> {
+        if self.is_writemap() {
+            return Ok(());
+        }
         let fd = self.env.data_fd();
         #[cfg(target_os = "macos")]
         {
@@ -1133,13 +1308,35 @@ impl<'env> RwTransaction<'env> {
         };
         meta_buf[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + meta_bytes.len()].copy_from_slice(meta_bytes);
 
-        // Write to file at offset toggle * page_size
-        let fd = self.env.data_fd();
-        let offset = (toggle * page_size) as i64;
-        // SAFETY: fd is a valid file descriptor. meta_buf is a valid buffer.
-        let written = unsafe { libc::pwrite(fd, meta_buf.as_ptr().cast(), meta_buf.len(), offset) };
-        if written < 0 || written as usize != meta_buf.len() {
-            return Err(Error::Io(std::io::Error::last_os_error()));
+        if self.is_writemap() {
+            // WRITEMAP: write meta page directly to the mmap and msync.
+            let offset = toggle * page_size;
+            // SAFETY: We hold the exclusive writer lock. The mmap is writable.
+            let dst = unsafe { self.env.mmap_mut_ptr().add(offset) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(meta_buf.as_ptr(), dst, meta_buf.len());
+            }
+            // msync just the meta page.
+            let rc = unsafe {
+                libc::msync(
+                    self.env.mmap_mut_ptr().cast(),
+                    self.env.map_size,
+                    libc::MS_SYNC,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::Io(std::io::Error::last_os_error()));
+            }
+        } else {
+            // Normal mode: pwrite the meta page.
+            let fd = self.env.data_fd();
+            let offset = (toggle * page_size) as i64;
+            // SAFETY: fd is a valid file descriptor. meta_buf is a valid buffer.
+            let written =
+                unsafe { libc::pwrite(fd, meta_buf.as_ptr().cast(), meta_buf.len(), offset) };
+            if written < 0 || written as usize != meta_buf.len() {
+                return Err(Error::Io(std::io::Error::last_os_error()));
+            }
         }
 
         Ok(())
@@ -1171,6 +1368,20 @@ impl Drop for RwTransaction<'_> {
         if !self.finished {
             // Implicitly abort -- discard dirty pages
             self.finished = true;
+        }
+        // Release cross-process file lock.
+        release_file_lock(self.env);
+    }
+}
+
+/// Release the cross-process file lock if one is held.
+fn release_file_lock(env: &EnvironmentInner) {
+    if let Some(ref lock_file) = env.lock_file {
+        use std::os::fd::AsRawFd;
+        let fd = lock_file.as_raw_fd();
+        // SAFETY: fd is a valid file descriptor from the lock file.
+        unsafe {
+            libc::flock(fd, libc::LOCK_UN);
         }
     }
 }
@@ -3011,5 +3222,316 @@ mod tests {
             "expected page reclamation without reader: \
              after_reader_drop={pgno_after_reader_drop}, after_reclaim={pgno_after_reclaim}",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature: MDB_RESERVE
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_reserve_and_fill_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let buf = txn.reserve(MAIN_DBI as u32, b"rkey", 5).expect("reserve");
+            assert_eq!(buf.len(), 5);
+            buf.copy_from_slice(b"rval!");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let val = txn.get(MAIN_DBI as u32, b"rkey").expect("get");
+            assert_eq!(val, b"rval!");
+        }
+    }
+
+    #[test]
+    fn test_should_reserve_large_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let data_len = 256;
+        let expected: Vec<u8> = (0..data_len).map(|i| (i % 256) as u8).collect();
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let buf = txn
+                .reserve(MAIN_DBI as u32, b"bigkey", data_len)
+                .expect("reserve");
+            assert_eq!(buf.len(), data_len);
+            buf.copy_from_slice(&expected);
+            txn.commit().expect("commit");
+        }
+
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let val = txn.get(MAIN_DBI as u32, b"bigkey").expect("get");
+            assert_eq!(val, &expected[..]);
+        }
+    }
+
+    #[test]
+    fn test_should_reserve_zero_length_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let buf = txn.reserve(MAIN_DBI as u32, b"empty", 0).expect("reserve");
+            assert_eq!(buf.len(), 0);
+            txn.commit().expect("commit");
+        }
+
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let val = txn.get(MAIN_DBI as u32, b"empty").expect("get");
+            assert_eq!(val, b"");
+        }
+    }
+
+    #[test]
+    fn test_should_reserve_overwrite_existing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"k", b"old", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let buf = txn.reserve(MAIN_DBI as u32, b"k", 3).expect("reserve");
+            buf.copy_from_slice(b"new");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let val = txn.get(MAIN_DBI as u32, b"k").expect("get");
+            assert_eq!(val, b"new");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature: WRITEMAP mode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_put_and_get_with_writemap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .flags(EnvFlags::WRITE_MAP)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"wm_key", b"wm_val", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let val = txn.get(MAIN_DBI as u32, b"wm_key").expect("get");
+            assert_eq!(val, b"wm_val");
+        }
+    }
+
+    #[test]
+    fn test_should_persist_multiple_keys_with_writemap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .flags(EnvFlags::WRITE_MAP)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..50 {
+                let key = format!("key_{i:04}");
+                let val = format!("val_{i:04}");
+                txn.put(
+                    MAIN_DBI as u32,
+                    key.as_bytes(),
+                    val.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .expect("put");
+            }
+            txn.commit().expect("commit");
+        }
+
+        // Re-open to verify persistence.
+        drop(env);
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .flags(EnvFlags::WRITE_MAP)
+            .open(dir.path())
+            .expect("reopen");
+
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            for i in 0..50 {
+                let key = format!("key_{i:04}");
+                let expected = format!("val_{i:04}");
+                let val = txn.get(MAIN_DBI as u32, key.as_bytes()).expect("get");
+                assert_eq!(val, expected.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn test_should_delete_with_writemap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .flags(EnvFlags::WRITE_MAP)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"del_me", b"gone", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.del(MAIN_DBI as u32, b"del_me", None).expect("del");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let result = txn.get(MAIN_DBI as u32, b"del_me");
+            assert!(matches!(result, Err(Error::NotFound)));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature: Cross-process lock file
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_create_lock_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let lock_path = dir.path().join("lock.mdb");
+        assert!(lock_path.exists(), "lock file should be created");
+    }
+
+    #[test]
+    fn test_should_create_lock_file_no_sub_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_path = dir.path().join("test.mdb");
+        let _env = Environment::builder()
+            .map_size(1024 * 1024)
+            .flags(EnvFlags::NO_SUB_DIR)
+            .open(&data_path)
+            .expect("open");
+
+        let lock_path_str = format!("{}-lock", data_path.display());
+        assert!(
+            std::path::Path::new(&lock_path_str).exists(),
+            "lock file should be created for NO_SUB_DIR",
+        );
+    }
+
+    #[test]
+    fn test_should_skip_lock_file_with_no_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _env = Environment::builder()
+            .map_size(1024 * 1024)
+            .flags(EnvFlags::NO_LOCK)
+            .open(dir.path())
+            .expect("open");
+
+        let lock_path = dir.path().join("lock.mdb");
+        assert!(
+            !lock_path.exists(),
+            "lock file should NOT be created with NO_LOCK"
+        );
+    }
+
+    #[test]
+    fn test_should_release_lock_on_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        // First transaction
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"k1", b"v1", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        // Second transaction (should succeed if lock was released)
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"k2", b"v2", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            assert_eq!(txn.get(MAIN_DBI as u32, b"k1").expect("get"), b"v1");
+            assert_eq!(txn.get(MAIN_DBI as u32, b"k2").expect("get"), b"v2");
+        }
+    }
+
+    #[test]
+    fn test_should_release_lock_on_abort() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        // Aborted transaction
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"k1", b"v1", WriteFlags::empty())
+                .expect("put");
+            txn.abort();
+        }
+
+        // Next transaction should succeed (lock released)
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"k2", b"v2", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
     }
 }
