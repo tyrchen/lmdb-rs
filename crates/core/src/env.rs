@@ -352,6 +352,13 @@ impl EnvironmentInner {
         let guard = self.db_dcmp.read().map_err(|_| Error::Panic)?;
         guard.get(dbi as usize).cloned().ok_or(Error::BadDbi)
     }
+
+    /// Return the raw file descriptor of the data file.
+    #[cfg(unix)]
+    pub(crate) fn data_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self._data_file.as_raw_fd()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +566,20 @@ impl Environment {
     /// Returns an error if the environment is in a fatal-error state.
     pub fn begin_ro_txn(&self) -> Result<crate::txn::RoTransaction<'_>> {
         crate::txn::RoTransaction::new(&self.inner)
+    }
+
+    /// Begin a read-write transaction.
+    ///
+    /// Only one write transaction may be active at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the environment is read-only or in a fatal state.
+    pub fn begin_rw_txn(&self) -> Result<crate::write::RwTransaction<'_>> {
+        if self.inner.flags.contains(EnvFlags::READ_ONLY) {
+            return Err(Error::Incompatible);
+        }
+        crate::write::RwTransaction::new(&self.inner)
     }
 
     /// Return statistics for the main database.
