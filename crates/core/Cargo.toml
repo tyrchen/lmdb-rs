@@ -1,0 +1,22 @@
+[package]
+name = "lmdb-rs-core"
+description = "Pure Rust reimplementation of LMDB (Lightning Memory-Mapped Database)"
+categories = ["database", "data-structures"]
+keywords = ["lmdb", "key-value", "mmap", "btree", "embedded-database"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+bitflags.workspace = true
+libc.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

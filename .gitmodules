@@ -1,0 +1,3 @@
+[submodule "vendors/lmdb"]
+	path = vendors/lmdb
+	url = https://github.com/LMDB/lmdb

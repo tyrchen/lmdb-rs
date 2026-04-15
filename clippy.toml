@@ -1,0 +1,6 @@
+msrv = "1.85"
+
+# Note: std::fs restrictions removed from the original template.
+# LMDB is a synchronous mmap-based database — it requires std::fs
+# for file operations. Using tokio::fs would add unnecessary overhead
+# and complexity with no benefit.
