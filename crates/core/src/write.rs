@@ -244,6 +244,9 @@ pub struct RwTransaction<'env> {
     finished: bool,
     /// Stack of savepoints for nested transactions.
     savepoints: Vec<SavePoint>,
+    /// Writer mutex guard — held for the entire transaction lifetime.
+    /// Ensures only one writer at a time within this process.
+    _write_guard: std::sync::MutexGuard<'env, ()>,
 }
 
 impl std::fmt::Debug for RwTransaction<'_> {
@@ -268,12 +271,8 @@ impl<'env> RwTransaction<'env> {
     ///
     /// Returns an error if the environment is in a fatal state.
     pub(crate) fn new(env: &'env EnvironmentInner) -> Result<Self> {
-        // Acquire writer lock — only one writer at a time.
-        // We lock but don't store the guard; Drop on RwTransaction won't
-        // unlock, but since we consume `self` in commit/abort this is safe
-        // for single-process use. Full lock management comes with Phase 6.
-        let _guard = env.write_mutex.lock().map_err(|_| Error::Panic)?;
-        drop(_guard); // Release immediately for now — true serialization needs stored guard
+        // Acquire writer lock — held for the entire transaction lifetime.
+        let write_guard = env.write_mutex.lock().map_err(|_| Error::Panic)?;
         let meta = env.meta();
         let txnid = meta.txnid + 1;
         let next_pgno = meta.last_pgno + 1;
@@ -292,6 +291,7 @@ impl<'env> RwTransaction<'env> {
             freelist_loaded: false,
             finished: false,
             savepoints: Vec::new(),
+            _write_guard: write_guard,
         })
     }
 
