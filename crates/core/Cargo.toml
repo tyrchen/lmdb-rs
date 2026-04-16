@@ -28,6 +28,7 @@ criterion = { version = "0.8", features = ["html_reports", "cargo_bench_support"
 rand = "0.9"
 rand_chacha = "0.9"
 rand_distr = "0.5"
+core_affinity = "0.8"
 
 [features]
 # Off by default so `cargo test` doesn't pull in the C toolchain.
@@ -59,6 +60,10 @@ harness = false
 
 [[bench]]
 name = "bench_admin"
+harness = false
+
+[[bench]]
+name = "bench_concurrent"
 harness = false
 
 [[bench]]

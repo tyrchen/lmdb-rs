@@ -26,7 +26,8 @@ bench: ## run full self-benchmark suite (no comparison)
 	    --bench bench_dupsort \
 	    --bench bench_txn \
 	    --bench bench_scaling \
-	    --bench bench_admin
+	    --bench bench_admin \
+	    --bench bench_concurrent
 
 bench-compare: ## run head-to-head Rust vs C LMDB comparison
 	@cargo bench -p lmdb-rs-core --features bench-compare --bench bench_compare
