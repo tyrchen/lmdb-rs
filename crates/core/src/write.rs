@@ -31,7 +31,11 @@ use crate::{
     env::EnvironmentInner,
     error::{Error, Result},
     page::Page,
-    types::*,
+    types::{
+        COMMIT_PAGES, CORE_DBS, CursorOp, DatabaseFlags, DbStat, EnvFlags, MDB_DATA_VERSION,
+        MDB_MAGIC, Meta, NODE_HEADER_SIZE, NodeFlags, P_INVALID, PAGE_HEADER_SIZE, PageFlags,
+        WriteFlags,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -910,10 +914,16 @@ impl<'env> RwTransaction<'env> {
 
     /// Open a write cursor on the specified database.
     ///
-    /// The cursor supports positional put and delete operations.
+    /// The cursor supports positional navigation, put, and delete operations.
     pub fn open_rw_cursor(&mut self, dbi: u32) -> Result<RwCursor<'_, 'env>> {
         let _ = self.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
-        Ok(RwCursor { txn: self, dbi })
+        Ok(RwCursor {
+            cursor: Cursor::new(self.env.page_size, dbi),
+            txn: self,
+            dbi,
+            dup_idx: 0,
+            dup_count: 1,
+        })
     }
 
     /// Read a value within a write transaction.
@@ -1115,6 +1125,16 @@ impl<'env> RwTransaction<'env> {
     #[must_use]
     pub fn txnid(&self) -> u64 {
         self.txnid
+    }
+
+    /// Return the database flags for the specified database handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BadDbi`] if `dbi` is invalid.
+    pub fn dbi_flags(&self, dbi: u32) -> Result<u16> {
+        let db = self.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
+        Ok(db.flags)
     }
 
     /// Set a custom key comparison function for the specified database.
@@ -1611,13 +1631,164 @@ fn release_file_lock(env: &EnvironmentInner) {
 // RwCursor — write cursor
 // ---------------------------------------------------------------------------
 
-/// A write cursor for positional put/del operations on a database.
+/// A write cursor for positional access and put/del operations on a database.
+///
+/// Wraps a read-only [`Cursor`] for navigation and provides write methods
+/// (`put`, `del`, `del_current`) that mutate the B+ tree through the
+/// underlying [`RwTransaction`].
 pub struct RwCursor<'txn, 'env> {
     txn: &'txn mut RwTransaction<'env>,
+    cursor: Cursor,
     dbi: u32,
+    /// Current dup index within a DUPSORT sub-page (0 for non-dup databases).
+    dup_idx: usize,
+    /// Total dup count at the current key position (1 for non-dup databases).
+    dup_count: usize,
 }
 
 impl<'txn, 'env> RwCursor<'txn, 'env> {
+    /// Position or advance the cursor and return the key/value at the new
+    /// position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] when the cursor reaches the end or the
+    /// requested key is not found.
+    pub fn get(&mut self, key: Option<&[u8]>, op: CursorOp) -> Result<(&[u8], &[u8])> {
+        let db = *self.txn.dbs.get(self.dbi as usize).ok_or(Error::BadDbi)?;
+        let root = db.root;
+        let cmp = self.txn.env.get_cmp(self.dbi)?;
+        let get_page = |pgno: u64| -> Result<*const u8> { self.txn.get_page(pgno) };
+
+        match op {
+            CursorOp::First => {
+                self.cursor.first(root, &**cmp, &get_page)?;
+                self.dup_idx = 0;
+                self.sync_dup_count();
+            }
+            CursorOp::Last => {
+                self.cursor.last(root, &**cmp, &get_page)?;
+                self.sync_dup_count();
+                self.dup_idx = self.dup_count.saturating_sub(1);
+            }
+            CursorOp::Next => {
+                if self.dup_count > 1 && self.dup_idx + 1 < self.dup_count {
+                    self.dup_idx += 1;
+                } else {
+                    self.cursor.next(&get_page)?;
+                    self.dup_idx = 0;
+                    self.sync_dup_count();
+                }
+            }
+            CursorOp::NextNoDup => {
+                self.cursor.next(&get_page)?;
+                self.dup_idx = 0;
+                self.sync_dup_count();
+            }
+            CursorOp::NextDup => {
+                if self.dup_idx + 1 < self.dup_count {
+                    self.dup_idx += 1;
+                } else {
+                    return Err(Error::NotFound);
+                }
+            }
+            CursorOp::Prev => {
+                if self.dup_count > 1 && self.dup_idx > 0 {
+                    self.dup_idx -= 1;
+                } else {
+                    self.cursor.prev(&get_page)?;
+                    self.sync_dup_count();
+                    self.dup_idx = self.dup_count.saturating_sub(1);
+                }
+            }
+            CursorOp::PrevNoDup => {
+                self.cursor.prev(&get_page)?;
+                self.sync_dup_count();
+                self.dup_idx = 0;
+            }
+            CursorOp::PrevDup => {
+                if self.dup_idx > 0 {
+                    self.dup_idx -= 1;
+                } else {
+                    return Err(Error::NotFound);
+                }
+            }
+            CursorOp::FirstDup => {
+                if !self.cursor.is_initialized() {
+                    return Err(Error::NotFound);
+                }
+                self.dup_idx = 0;
+            }
+            CursorOp::LastDup => {
+                if !self.cursor.is_initialized() {
+                    return Err(Error::NotFound);
+                }
+                self.sync_dup_count();
+                self.dup_idx = self.dup_count.saturating_sub(1);
+            }
+            CursorOp::Set | CursorOp::SetKey => {
+                let k = key.ok_or(Error::BadValSize)?;
+                self.cursor.set(root, k, &**cmp, &get_page)?;
+                self.dup_idx = 0;
+                self.sync_dup_count();
+            }
+            CursorOp::SetRange => {
+                let k = key.ok_or(Error::BadValSize)?;
+                self.cursor.page_search(root, Some(k), &**cmp, &get_page)?;
+                if self.cursor.current_key().is_none() {
+                    return Err(Error::NotFound);
+                }
+                self.dup_idx = 0;
+                self.sync_dup_count();
+            }
+            CursorOp::GetCurrent => {
+                if !self.cursor.is_initialized() {
+                    return Err(Error::NotFound);
+                }
+            }
+            CursorOp::GetBoth | CursorOp::GetBothRange => {
+                let k = key.ok_or(Error::BadValSize)?;
+                self.cursor.set(root, k, &**cmp, &get_page)?;
+                self.dup_idx = 0;
+                self.sync_dup_count();
+            }
+            _ => return Err(Error::Incompatible),
+        }
+
+        self.current_kv()
+    }
+
+    /// Return the number of duplicate values at the current cursor position.
+    ///
+    /// For non-DUPSORT databases this always returns 1.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the cursor is not positioned.
+    pub fn count(&self) -> Result<usize> {
+        if !self.cursor.is_initialized() {
+            return Err(Error::NotFound);
+        }
+        Ok(self.dup_count)
+    }
+
+    /// Delete at the current cursor position.
+    ///
+    /// The cursor must be positioned at a valid entry (i.e., initialized)
+    /// before calling this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the cursor is not positioned.
+    pub fn del_current(&mut self) -> Result<()> {
+        if !self.cursor.is_initialized() {
+            return Err(Error::NotFound);
+        }
+        let node = self.cursor.current_node().ok_or(Error::NotFound)?;
+        let key = node.key().to_vec();
+        btree::cursor_del(self.txn, self.dbi, &key, None)
+    }
+
     /// Insert a key/value pair via the cursor.
     pub fn put(&mut self, key: &[u8], data: &[u8], flags: WriteFlags) -> Result<()> {
         btree::cursor_put(self.txn, self.dbi, key, data, flags)
@@ -1627,11 +1798,50 @@ impl<'txn, 'env> RwCursor<'txn, 'env> {
     pub fn del(&mut self, key: &[u8], data: Option<&[u8]>) -> Result<()> {
         btree::cursor_del(self.txn, self.dbi, key, data)
     }
+
+    /// Synchronize the dup_count from the current node.
+    fn sync_dup_count(&mut self) {
+        if let Some(node) = self.cursor.current_node() {
+            self.dup_count = btree::dup_count(&node);
+        } else {
+            self.dup_count = 1;
+        }
+    }
+
+    /// Return the current key/value pair.
+    fn current_kv(&self) -> Result<(&[u8], &[u8])> {
+        let node = self.cursor.current_node().ok_or(Error::NotFound)?;
+
+        // SAFETY: data comes from mmap or dirty pages, both valid for the
+        // lifetime of the transaction. We transmute to extend the lifetime
+        // from the cursor's internal raw-pointer-derived references.
+        let key_out: &[u8] = unsafe { std::mem::transmute::<&[u8], &[u8]>(node.key()) };
+
+        let data_out: &[u8] = if node.is_bigdata() {
+            let pgno = node.overflow_pgno();
+            let data_size = node.data_size() as usize;
+            let ptr = self.txn.get_page(pgno)?;
+            unsafe {
+                let start = ptr.add(PAGE_HEADER_SIZE);
+                std::mem::transmute::<&[u8], &[u8]>(std::slice::from_raw_parts(start, data_size))
+            }
+        } else if node.is_dupdata() {
+            let val = crate::btree::get_dup_at_index(&node, self.dup_idx).ok_or(Error::NotFound)?;
+            unsafe { std::mem::transmute::<&[u8], &[u8]>(val) }
+        } else {
+            unsafe { std::mem::transmute::<&[u8], &[u8]>(node.node_data()) }
+        };
+
+        Ok((key_out, data_out))
+    }
 }
 
 impl std::fmt::Debug for RwCursor<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RwCursor").field("dbi", &self.dbi).finish()
+        f.debug_struct("RwCursor")
+            .field("dbi", &self.dbi)
+            .field("cursor", &self.cursor)
+            .finish()
     }
 }
 
@@ -4231,5 +4441,294 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // RwCursor navigation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_rw_cursor_navigate_first_next() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"aaa", b"111", WriteFlags::empty())
+                .expect("put");
+            txn.put(MAIN_DBI as u32, b"bbb", b"222", WriteFlags::empty())
+                .expect("put");
+            txn.put(MAIN_DBI as u32, b"ccc", b"333", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let mut cursor = txn.open_rw_cursor(MAIN_DBI as u32).expect("cursor");
+
+            // First
+            let (k, v) = cursor.get(None, CursorOp::First).expect("first");
+            assert_eq!(k, b"aaa");
+            assert_eq!(v, b"111");
+
+            // Next
+            let (k, v) = cursor.get(None, CursorOp::Next).expect("next");
+            assert_eq!(k, b"bbb");
+            assert_eq!(v, b"222");
+
+            // Next
+            let (k, v) = cursor.get(None, CursorOp::Next).expect("next");
+            assert_eq!(k, b"ccc");
+            assert_eq!(v, b"333");
+
+            // Next should fail
+            let result = cursor.get(None, CursorOp::Next);
+            assert!(matches!(result, Err(Error::NotFound)));
+        }
+    }
+
+    #[test]
+    fn test_should_rw_cursor_navigate_last_prev() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"aaa", b"111", WriteFlags::empty())
+                .expect("put");
+            txn.put(MAIN_DBI as u32, b"bbb", b"222", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let mut cursor = txn.open_rw_cursor(MAIN_DBI as u32).expect("cursor");
+
+            let (k, v) = cursor.get(None, CursorOp::Last).expect("last");
+            assert_eq!(k, b"bbb");
+            assert_eq!(v, b"222");
+
+            let (k, v) = cursor.get(None, CursorOp::Prev).expect("prev");
+            assert_eq!(k, b"aaa");
+            assert_eq!(v, b"111");
+        }
+    }
+
+    #[test]
+    fn test_should_rw_cursor_set_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"aaa", b"111", WriteFlags::empty())
+                .expect("put");
+            txn.put(MAIN_DBI as u32, b"bbb", b"222", WriteFlags::empty())
+                .expect("put");
+            txn.put(MAIN_DBI as u32, b"ccc", b"333", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let mut cursor = txn.open_rw_cursor(MAIN_DBI as u32).expect("cursor");
+
+            let (k, v) = cursor.get(Some(b"bbb"), CursorOp::Set).expect("set");
+            assert_eq!(k, b"bbb");
+            assert_eq!(v, b"222");
+        }
+    }
+
+    #[test]
+    fn test_should_rw_cursor_get_current() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"key", b"val", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let mut cursor = txn.open_rw_cursor(MAIN_DBI as u32).expect("cursor");
+
+            // GetCurrent on uninitialized cursor should fail.
+            let result = cursor.get(None, CursorOp::GetCurrent);
+            assert!(matches!(result, Err(Error::NotFound)));
+
+            // Position, then GetCurrent should work.
+            cursor.get(None, CursorOp::First).expect("first");
+            let (k, v) = cursor.get(None, CursorOp::GetCurrent).expect("current");
+            assert_eq!(k, b"key");
+            assert_eq!(v, b"val");
+        }
+    }
+
+    #[test]
+    fn test_should_rw_cursor_del_current() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"aaa", b"111", WriteFlags::empty())
+                .expect("put");
+            txn.put(MAIN_DBI as u32, b"bbb", b"222", WriteFlags::empty())
+                .expect("put");
+            txn.put(MAIN_DBI as u32, b"ccc", b"333", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            {
+                let mut cursor = txn.open_rw_cursor(MAIN_DBI as u32).expect("cursor");
+
+                // Position at "bbb" and delete it.
+                cursor.get(Some(b"bbb"), CursorOp::Set).expect("set");
+                cursor.del_current().expect("del_current");
+            }
+            txn.commit().expect("commit");
+        }
+
+        // Verify "bbb" is gone but others remain.
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            assert_eq!(txn.get(MAIN_DBI as u32, b"aaa").expect("get"), b"111");
+            assert!(matches!(
+                txn.get(MAIN_DBI as u32, b"bbb"),
+                Err(Error::NotFound),
+            ));
+            assert_eq!(txn.get(MAIN_DBI as u32, b"ccc").expect("get"), b"333");
+        }
+    }
+
+    #[test]
+    fn test_should_rw_cursor_del_current_uninitialized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+        let mut cursor = txn.open_rw_cursor(MAIN_DBI as u32).expect("cursor");
+        let result = cursor.del_current();
+        assert!(matches!(result, Err(Error::NotFound)));
+    }
+
+    #[test]
+    fn test_should_rw_cursor_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI as u32, b"key", b"val", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let mut cursor = txn.open_rw_cursor(MAIN_DBI as u32).expect("cursor");
+
+            // Count on uninitialized cursor should fail.
+            assert!(matches!(cursor.count(), Err(Error::NotFound)));
+
+            cursor.get(None, CursorOp::First).expect("first");
+            assert_eq!(cursor.count().expect("count"), 1);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // dbi_flags tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_return_dbi_flags_for_main_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let txn = env.begin_rw_txn().expect("begin_rw_txn");
+        let flags = txn.dbi_flags(MAIN_DBI as u32).expect("dbi_flags");
+        // Main DB has no special flags by default.
+        assert_eq!(flags, 0);
+        txn.abort();
+    }
+
+    #[test]
+    fn test_should_return_dbi_flags_for_dupsort_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(10 * 1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(
+                    Some("dupdb"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT,
+                )
+                .expect("open_db");
+            txn.put(dbi, b"key", b"val1", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            let dbi = txn
+                .open_db(Some("dupdb"), DatabaseFlags::DUP_SORT)
+                .expect("open_db");
+            let flags = txn.dbi_flags(dbi).expect("dbi_flags");
+            assert_eq!(flags & DatabaseFlags::DUP_SORT.bits() as u16, 0x04);
+            txn.abort();
+        }
+    }
+
+    #[test]
+    fn test_should_return_bad_dbi_for_invalid_handle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let txn = env.begin_rw_txn().expect("begin_rw_txn");
+        let result = txn.dbi_flags(999);
+        assert!(matches!(result, Err(Error::BadDbi)));
+        txn.abort();
     }
 }

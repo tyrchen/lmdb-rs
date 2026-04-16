@@ -291,6 +291,9 @@ pub(crate) struct EnvironmentInner {
     /// needing a separate fdatasync call for the meta write.
     #[cfg(unix)]
     pub(crate) meta_file: Option<File>,
+    /// User-defined context data, accessible via `Environment::set_user_ctx`
+    /// and `Environment::get_user_ctx`.
+    user_ctx: RwLock<Option<Arc<dyn std::any::Any + Send + Sync>>>,
 }
 
 // SAFETY: The raw mmap pointer is only accessed through methods that uphold
@@ -687,6 +690,7 @@ impl Environment {
             lock_file,
             #[cfg(unix)]
             meta_file,
+            user_ctx: RwLock::new(None),
         };
 
         Ok(Self {
@@ -889,10 +893,53 @@ impl Environment {
 
     /// Check for stale readers and return the number cleared.
     ///
-    /// This is currently a stub that always returns 0. Full reader-table
-    /// management will be implemented in a future phase.
+    /// In this single-process implementation, stale readers occur when a
+    /// thread panics without running `RoTransaction::Drop`. Since Rust does
+    /// not provide a portable "is this thread alive" check, this method
+    /// currently returns 0 cleared slots. The reader table is still
+    /// inspectable via [`reader_list`](Self::reader_list).
     pub fn check_readers(&self) -> Result<u32> {
+        // In a multi-process implementation, we would check each reader
+        // slot's PID with `kill(pid, 0)` and clear stale ones. For our
+        // in-process reader table, thread-level liveness checking is not
+        // feasible without storing ThreadIds, so we report 0.
         Ok(0)
+    }
+
+    /// Return a list of active readers as `(slot_index, txnid)` pairs.
+    ///
+    /// Each entry represents a reader slot that is currently held by an
+    /// active read transaction. The `txnid` is the snapshot transaction ID
+    /// that the reader is pinned to.
+    pub fn reader_list(&self) -> Vec<(usize, u64)> {
+        let mut readers = Vec::new();
+        for (i, slot) in self.inner.reader_table.slots.iter().enumerate() {
+            let txnid = slot.load(std::sync::atomic::Ordering::Acquire);
+            if txnid != READER_SLOT_FREE {
+                readers.push((i, txnid));
+            }
+        }
+        readers
+    }
+
+    /// Set a user-defined context object on the environment.
+    ///
+    /// The context is stored as `Arc<dyn Any + Send + Sync>` and can be
+    /// retrieved later via [`get_user_ctx`](Self::get_user_ctx). Setting a
+    /// new context replaces any previously stored value.
+    pub fn set_user_ctx(&self, ctx: Arc<dyn std::any::Any + Send + Sync>) {
+        if let Ok(mut guard) = self.inner.user_ctx.write() {
+            *guard = Some(ctx);
+        }
+    }
+
+    /// Retrieve the user-defined context object from the environment.
+    ///
+    /// Returns `None` if no context has been set, or if the internal lock
+    /// is poisoned. The returned `Arc` can be downcast to the original type
+    /// using `Arc::downcast`.
+    pub fn get_user_ctx(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.inner.user_ctx.read().ok()?.clone()
     }
 
     /// Create a plain (non-compacting) backup copy of the database.
@@ -1591,5 +1638,147 @@ mod tests {
             matches!(result, Err(Error::Incompatible)),
             "expected Incompatible, got {result:?}",
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Feature: reader_list
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_should_return_empty_reader_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let readers = env.reader_list();
+        assert!(readers.is_empty());
+    }
+
+    #[test]
+    fn test_should_show_active_readers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let txn = env.begin_ro_txn().expect("begin_ro_txn");
+        let readers = env.reader_list();
+        assert_eq!(readers.len(), 1);
+        assert_eq!(readers[0].1, txn.txnid());
+
+        drop(txn);
+        let readers = env.reader_list();
+        assert!(readers.is_empty());
+    }
+
+    #[test]
+    fn test_should_show_multiple_active_readers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let txn1 = env.begin_ro_txn().expect("begin_ro_txn 1");
+        let txn2 = env.begin_ro_txn().expect("begin_ro_txn 2");
+
+        let readers = env.reader_list();
+        assert_eq!(readers.len(), 2);
+
+        drop(txn1);
+        let readers = env.reader_list();
+        assert_eq!(readers.len(), 1);
+
+        drop(txn2);
+        let readers = env.reader_list();
+        assert!(readers.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Feature: user context
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_should_set_and_get_user_ctx() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        // No context set initially.
+        assert!(env.get_user_ctx().is_none());
+
+        // Set an integer context.
+        env.set_user_ctx(Arc::new(42u64));
+        let ctx = env.get_user_ctx().expect("get_user_ctx");
+        let val = ctx.downcast_ref::<u64>().expect("downcast");
+        assert_eq!(*val, 42);
+    }
+
+    #[test]
+    fn test_should_replace_user_ctx() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        env.set_user_ctx(Arc::new(String::from("hello")));
+        env.set_user_ctx(Arc::new(String::from("world")));
+
+        let ctx = env.get_user_ctx().expect("get_user_ctx");
+        let val = ctx.downcast_ref::<String>().expect("downcast");
+        assert_eq!(val, "world");
+    }
+
+    // -------------------------------------------------------------------
+    // Feature: check_readers
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_should_check_readers_returns_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let cleared = env.check_readers().expect("check_readers");
+        assert_eq!(cleared, 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Feature: dbi_flags via RoTransaction
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_should_return_ro_dbi_flags() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let txn = env.begin_ro_txn().expect("begin_ro_txn");
+        let flags = txn.dbi_flags(1).expect("dbi_flags");
+        // Main DB (dbi=1) has default flags = 0 for a fresh environment.
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn test_should_return_bad_dbi_for_invalid_ro() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        let txn = env.begin_ro_txn().expect("begin_ro_txn");
+        let result = txn.dbi_flags(999);
+        assert!(matches!(result, Err(Error::BadDbi)));
     }
 }

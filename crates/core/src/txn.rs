@@ -274,6 +274,16 @@ impl<'env> RoTransaction<'env> {
         })
     }
 
+    /// Return the database flags for the specified database handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BadDbi`] if `dbi` is invalid.
+    pub fn dbi_flags(&self, dbi: u32) -> Result<u16> {
+        let db = self.db(dbi)?;
+        Ok(db.flags)
+    }
+
     /// Resolve a database handle to its metadata.
     fn db(&self, dbi: u32) -> Result<&DbStat> {
         self.dbs.get(dbi as usize).ok_or(Error::BadDbi)
