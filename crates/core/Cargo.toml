@@ -20,3 +20,11 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+criterion = { version = "0.8", features = ["html_reports", "cargo_bench_support"] }
+rand = "0.9"
+rand_chacha = "0.9"
+rand_distr = "0.5"
+
+[[bench]]
+name = "bench_read"
+harness = false
