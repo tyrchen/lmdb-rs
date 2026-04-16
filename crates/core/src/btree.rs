@@ -274,7 +274,12 @@ pub fn cursor_put_with_flags(
     }
 
     // Walk the tree from root to leaf, COW-ing each page.
-    let cmp = txn.env.get_cmp(dbi)?;
+    // `cmp` is a cheap Arc clone from the local per-txn cache — no RwLock.
+    let cmp = txn
+        .cmp_cache
+        .get(dbi as usize)
+        .ok_or(Error::BadDbi)?
+        .clone();
 
     // APPEND fast-path: walk to the last leaf, verify key ordering.
     if flags.contains(WriteFlags::APPEND) {
@@ -297,7 +302,11 @@ pub fn cursor_put_with_flags(
     if exact && insert_idx < nkeys {
         if db_is_dupsort {
             // DUPSORT: insert the value as a duplicate, don't overwrite the key
-            let dcmp = txn.env.get_dcmp(dbi)?;
+            let dcmp = txn
+                .dcmp_cache
+                .get(dbi as usize)
+                .ok_or(Error::BadDbi)?
+                .clone();
             return dupsort_put(
                 txn, dbi, &path, leaf_pgno, insert_idx, key, data, flags, &**dcmp,
             );
@@ -421,7 +430,11 @@ pub fn cursor_del(
         return Err(Error::NotFound);
     }
 
-    let cmp = txn.env.get_cmp(dbi)?;
+    let cmp = txn
+        .cmp_cache
+        .get(dbi as usize)
+        .ok_or(Error::BadDbi)?
+        .clone();
     let page_size = txn.env.page_size;
 
     // Walk the tree, COW-ing each page.
@@ -763,38 +776,40 @@ fn read_dirty_page<'a>(
 
 /// Update a branch node's child page number in-place.
 ///
-/// This is needed when a child page is COW'd to a new page number.
+/// Called on every COW descent when the child gets a new page number — so
+/// this is on the write hot path. The previous implementation did
+/// `node_del` + `node_add`, each an O(n) shift of the page's pointer array
+/// and an even-aligned memmove of the node data area. Since only the 6
+/// bytes encoding the 48-bit child pgno change (lo/hi/flags fields of the
+/// node header), we overwrite them directly; the key, pointer array, and
+/// all sibling nodes stay put.
+#[inline]
 fn update_branch_child(
     txn: &mut RwTransaction<'_>,
     branch_pgno: u64,
     child_idx: usize,
     new_child_pgno: u64,
-    page_size: usize,
+    _page_size: usize,
 ) -> Result<()> {
     let buf = txn.dirty.find_mut(branch_pgno).ok_or(Error::Corrupted)?;
-    let page = Page::from_raw(buf.as_slice());
-    let node_offset = page.ptr_at(child_idx) as usize;
+    let slice = buf.as_mut_slice();
 
-    // Read the existing key from the node.
-    let key_size = u16::from_le_bytes([
-        buf.as_slice()[node_offset + 6],
-        buf.as_slice()[node_offset + 7],
-    ]) as usize;
-    let key: Vec<u8> = buf.as_slice()
-        [node_offset + NODE_HEADER_SIZE..node_offset + NODE_HEADER_SIZE + key_size]
-        .to_vec();
+    // Locate the target node header via the pointer array.
+    let ptr_offset = PAGE_HEADER_SIZE + child_idx * 2;
+    let node_offset = u16::from_le_bytes([slice[ptr_offset], slice[ptr_offset + 1]]) as usize;
 
-    // Delete the old node and re-add with the new child pgno.
-    node_del(buf.as_mut_slice(), page_size, child_idx);
-    node_add(
-        buf.as_mut_slice(),
-        page_size,
-        child_idx,
-        &key,
-        &[],
-        new_child_pgno,
-        NodeFlags::empty(),
-    )?;
+    // Encode the 48-bit pgno into the 6 bytes at [node_offset, node_offset+6).
+    //   lo    = pgno & 0xFFFF           (offset 0..2)
+    //   hi    = (pgno >> 16) & 0xFFFF   (offset 2..4)
+    //   flags = (pgno >> 32) & 0xFFFF   (offset 4..6)   -- branch nodes reuse
+    //                                                      the flags slot as
+    //                                                      the high pgno bits.
+    let lo = (new_child_pgno & 0xFFFF) as u16;
+    let hi = ((new_child_pgno >> 16) & 0xFFFF) as u16;
+    let flags_raw = ((new_child_pgno >> 32) & 0xFFFF) as u16;
+    slice[node_offset..node_offset + 2].copy_from_slice(&lo.to_le_bytes());
+    slice[node_offset + 2..node_offset + 4].copy_from_slice(&hi.to_le_bytes());
+    slice[node_offset + 4..node_offset + 6].copy_from_slice(&flags_raw.to_le_bytes());
 
     Ok(())
 }

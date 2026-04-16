@@ -252,6 +252,13 @@ pub struct RwTransaction<'env> {
     finished: bool,
     /// Stack of savepoints for nested transactions.
     savepoints: Vec<SavePoint>,
+    /// Local snapshot of the env's per-dbi key comparators. Populated at
+    /// construction and refreshed when a named database is registered.
+    /// Lets `cursor_put` and friends skip the env RwLock + Arc clone that
+    /// would otherwise fire on every put.
+    pub(crate) cmp_cache: Vec<Arc<Box<crate::cmp::CmpFn>>>,
+    /// Local snapshot of the env's per-dbi data comparators (DUPSORT).
+    pub(crate) dcmp_cache: Vec<Arc<Box<crate::cmp::CmpFn>>>,
     /// Writer mutex guard — held for the entire transaction lifetime.
     /// Ensures only one writer at a time within this process.
     _write_guard: std::sync::MutexGuard<'env, ()>,
@@ -297,6 +304,10 @@ impl<'env> RwTransaction<'env> {
         let txnid = meta.txnid + 1;
         let next_pgno = meta.last_pgno + 1;
 
+        // Snapshot per-dbi cmp/dcmp so hot paths avoid the env RwLock.
+        let cmp_cache = env.db_cmp.read().map_err(|_| Error::Panic)?.clone();
+        let dcmp_cache = env.db_dcmp.read().map_err(|_| Error::Panic)?.clone();
+
         Ok(Self {
             env,
             txnid,
@@ -311,8 +322,33 @@ impl<'env> RwTransaction<'env> {
             freelist_loaded: false,
             finished: false,
             savepoints: Vec::new(),
+            cmp_cache,
+            dcmp_cache,
             _write_guard: write_guard,
         })
+    }
+
+    /// Borrow the cached key comparator for `dbi`. Cheap — no lock, no clone.
+    #[inline]
+    pub(crate) fn cmp_ref(&self, dbi: u32) -> Result<&crate::cmp::CmpFn> {
+        let arc = self.cmp_cache.get(dbi as usize).ok_or(Error::BadDbi)?;
+        Ok(&***arc)
+    }
+
+    /// Borrow the cached data comparator for `dbi`. Used by DUPSORT paths.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn dcmp_ref(&self, dbi: u32) -> Result<&crate::cmp::CmpFn> {
+        let arc = self.dcmp_cache.get(dbi as usize).ok_or(Error::BadDbi)?;
+        Ok(&***arc)
+    }
+
+    /// Refresh `cmp_cache` / `dcmp_cache` from the env. Call after
+    /// registering a new DBI.
+    pub(crate) fn refresh_cmp_cache(&mut self) -> Result<()> {
+        self.cmp_cache = self.env.db_cmp.read().map_err(|_| Error::Panic)?.clone();
+        self.dcmp_cache = self.env.db_dcmp.read().map_err(|_| Error::Panic)?.clone();
+        Ok(())
     }
 
     /// Resolve a page number to a page pointer.
@@ -614,22 +650,24 @@ impl<'env> RwTransaction<'env> {
         };
 
         // Register in environment.
-        let mut db_names = self.env.db_names.write().map_err(|_| Error::Panic)?;
-        let mut db_cmp = self.env.db_cmp.write().map_err(|_| Error::Panic)?;
-        let mut db_dcmp = self.env.db_dcmp.write().map_err(|_| Error::Panic)?;
-        let mut db_flags_vec = self.env.db_flags.write().map_err(|_| Error::Panic)?;
+        {
+            let mut db_names = self.env.db_names.write().map_err(|_| Error::Panic)?;
+            let mut db_cmp = self.env.db_cmp.write().map_err(|_| Error::Panic)?;
+            let mut db_dcmp = self.env.db_dcmp.write().map_err(|_| Error::Panic)?;
+            let mut db_flags_vec = self.env.db_flags.write().map_err(|_| Error::Panic)?;
 
-        while db_names.len() <= dbi {
-            db_names.push(None);
-            db_cmp.push(Arc::new(default_cmp(0)));
-            db_dcmp.push(Arc::new(default_dcmp(0)));
-            db_flags_vec.push(0);
+            while db_names.len() <= dbi {
+                db_names.push(None);
+                db_cmp.push(Arc::new(default_cmp(0)));
+                db_dcmp.push(Arc::new(default_dcmp(0)));
+                db_flags_vec.push(0);
+            }
+
+            db_names[dbi] = Some(name.to_string());
+            db_cmp[dbi] = Arc::new(default_cmp(db.flags));
+            db_dcmp[dbi] = Arc::new(default_dcmp(db.flags));
+            db_flags_vec[dbi] = db.flags;
         }
-
-        db_names[dbi] = Some(name.to_string());
-        db_cmp[dbi] = Arc::new(default_cmp(db.flags));
-        db_dcmp[dbi] = Arc::new(default_dcmp(db.flags));
-        db_flags_vec[dbi] = db.flags;
 
         // Ensure our local dbs/db_dirty arrays are large enough.
         while self.dbs.len() <= dbi {
@@ -638,6 +676,9 @@ impl<'env> RwTransaction<'env> {
         }
         self.dbs[dbi] = db;
         self.db_dirty[dbi] = true;
+
+        // Re-sync local cmp cache so subsequent ops on this dbi are cheap.
+        self.refresh_cmp_cache()?;
 
         Ok(dbi as u32)
     }
@@ -940,11 +981,11 @@ impl<'env> RwTransaction<'env> {
             return Err(Error::NotFound);
         }
 
-        let cmp = self.env.get_cmp(dbi)?;
+        let cmp = self.cmp_ref(dbi)?;
         let mut cursor = Cursor::new(self.env.page_size, dbi);
         let get_page = |pgno: u64| -> Result<*const u8> { self.get_page(pgno) };
 
-        cursor.page_search(db.root, Some(key), &*cmp, &get_page)?;
+        cursor.page_search(db.root, Some(key), cmp, &get_page)?;
 
         let node = cursor.current_node().ok_or(Error::NotFound)?;
         // SAFETY: data is from mmap or dirty pages, both live long enough
@@ -1147,12 +1188,20 @@ impl<'env> RwTransaction<'env> {
     ///
     /// Returns [`Error::BadDbi`] if `dbi` is out of range.
     /// Returns [`Error::Panic`] if the internal lock is poisoned.
-    pub fn set_compare(&self, dbi: u32, cmp: Box<crate::cmp::CmpFn>) -> Result<()> {
-        let mut db_cmp = self.env.db_cmp.write().map_err(|_| Error::Panic)?;
-        if dbi as usize >= db_cmp.len() {
-            return Err(Error::BadDbi);
+    pub fn set_compare(&mut self, dbi: u32, cmp: Box<crate::cmp::CmpFn>) -> Result<()> {
+        let arc = Arc::new(cmp);
+        {
+            let mut db_cmp = self.env.db_cmp.write().map_err(|_| Error::Panic)?;
+            if dbi as usize >= db_cmp.len() {
+                return Err(Error::BadDbi);
+            }
+            db_cmp[dbi as usize] = arc.clone();
         }
-        db_cmp[dbi as usize] = Arc::new(cmp);
+        // Also update the per-txn cache so hot paths see the new comparator
+        // without a RwLock read.
+        if let Some(slot) = self.cmp_cache.get_mut(dbi as usize) {
+            *slot = arc;
+        }
         Ok(())
     }
 
@@ -1166,12 +1215,18 @@ impl<'env> RwTransaction<'env> {
     ///
     /// Returns [`Error::BadDbi`] if `dbi` is out of range.
     /// Returns [`Error::Panic`] if the internal lock is poisoned.
-    pub fn set_dupsort(&self, dbi: u32, cmp: Box<crate::cmp::CmpFn>) -> Result<()> {
-        let mut db_dcmp = self.env.db_dcmp.write().map_err(|_| Error::Panic)?;
-        if dbi as usize >= db_dcmp.len() {
-            return Err(Error::BadDbi);
+    pub fn set_dupsort(&mut self, dbi: u32, cmp: Box<crate::cmp::CmpFn>) -> Result<()> {
+        let arc = Arc::new(cmp);
+        {
+            let mut db_dcmp = self.env.db_dcmp.write().map_err(|_| Error::Panic)?;
+            if dbi as usize >= db_dcmp.len() {
+                return Err(Error::BadDbi);
+            }
+            db_dcmp[dbi as usize] = arc.clone();
         }
-        db_dcmp[dbi as usize] = Arc::new(cmp);
+        if let Some(slot) = self.dcmp_cache.get_mut(dbi as usize) {
+            *slot = arc;
+        }
         Ok(())
     }
 

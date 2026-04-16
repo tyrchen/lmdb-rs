@@ -4,9 +4,10 @@
 //! [`RoTransaction`] provides zero-copy read access to a consistent snapshot.
 //! Write transactions will be added in Phase 2.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc};
 
 use crate::{
+    cmp::CmpFn,
     cursor::Cursor,
     env::EnvironmentInner,
     error::{Error, Result},
@@ -34,6 +35,10 @@ pub struct RoTransaction<'env> {
     dbs: Vec<DbStat>,
     /// Reader table slot index, released on drop.
     reader_slot: Option<usize>,
+    /// Local snapshot of the env's per-dbi key comparators. Populated at
+    /// construction; refreshed when a named database is registered. Lets
+    /// the hot path avoid a per-op `RwLock::read` + `Arc::clone`.
+    pub(crate) cmp_cache: Vec<Arc<Box<CmpFn>>>,
 }
 
 impl<'env> RoTransaction<'env> {
@@ -50,12 +55,30 @@ impl<'env> RoTransaction<'env> {
         let meta = env.meta();
         let txnid = meta.txnid;
         let slot = env.reader_table.acquire(txnid)?;
+        // Snapshot the per-dbi comparator list once — subsequent hot-path
+        // lookups then avoid the env RwLock + Arc clone per op.
+        let cmp_cache = env.db_cmp.read().map_err(|_| Error::Panic)?.clone();
         Ok(Self {
             env,
             txnid,
             dbs: vec![meta.dbs[0], meta.dbs[1]],
             reader_slot: Some(slot),
+            cmp_cache,
         })
+    }
+
+    /// Borrow the cached key comparator for `dbi`. Much cheaper than
+    /// `env.get_cmp`: no RwLock acquire, no Arc clone.
+    #[inline]
+    pub(crate) fn cmp_ref(&self, dbi: u32) -> Result<&CmpFn> {
+        let arc = self.cmp_cache.get(dbi as usize).ok_or(Error::BadDbi)?;
+        Ok(&***arc)
+    }
+
+    /// Refresh `cmp_cache` from the env. Call after registering a new DBI.
+    fn refresh_cmp_cache(&mut self) -> Result<()> {
+        self.cmp_cache = self.env.db_cmp.read().map_err(|_| Error::Panic)?.clone();
+        Ok(())
     }
 
     /// Retrieve data by key from the specified database.
@@ -73,11 +96,11 @@ impl<'env> RoTransaction<'env> {
             return Err(Error::NotFound);
         }
 
-        let cmp = self.env.get_cmp(dbi)?;
+        let cmp = self.cmp_ref(dbi)?;
         let mut cursor = Cursor::new(self.env.page_size, dbi);
         let get_page = |pgno: u64| self.env.get_page(pgno);
 
-        cursor.page_search(db.root, Some(key), &*cmp, &get_page)?;
+        cursor.page_search(db.root, Some(key), cmp, &get_page)?;
 
         // The cursor's current_node() returns data from the mmap, which
         // has lifetime 'env. We use transmute to extend the lifetime from
@@ -116,9 +139,17 @@ impl<'env> RoTransaction<'env> {
     pub fn open_cursor(&self, dbi: u32) -> Result<RoCursor<'_, 'env>> {
         let _db = self.db(dbi)?;
         let cursor = Cursor::new(self.env.page_size, dbi);
+        // Cache cmp + db_flags once at open — hot-path ops (Next on a
+        // seq_scan) avoid the env.get_cmp RwLock acquire + Arc clone that
+        // would otherwise cost 20-30 ns per call.
+        let cmp = self.env.get_cmp(dbi)?;
+        let db_flags = self.env.get_db_flags(dbi)?;
+        let is_dupsort = db_flags & DatabaseFlags::DUP_SORT.bits() as u16 != 0;
         Ok(RoCursor {
             txn: self,
             cursor,
+            cmp,
+            is_dupsort,
             dup_idx: 0,
             dup_count: 0,
         })
@@ -189,8 +220,6 @@ impl<'env> RoTransaction<'env> {
 
     /// Register a named database for read-only access.
     fn register_db_ro(&mut self, name: &str, db: DbStat) -> Result<u32> {
-        use std::sync::Arc;
-
         use crate::cmp::{default_cmp, default_dcmp};
 
         let dbi = {
@@ -198,28 +227,33 @@ impl<'env> RoTransaction<'env> {
             db_names.len()
         };
 
-        let mut db_names = self.env.db_names.write().map_err(|_| Error::Panic)?;
-        let mut db_cmp = self.env.db_cmp.write().map_err(|_| Error::Panic)?;
-        let mut db_dcmp = self.env.db_dcmp.write().map_err(|_| Error::Panic)?;
-        let mut db_flags_vec = self.env.db_flags.write().map_err(|_| Error::Panic)?;
+        {
+            let mut db_names = self.env.db_names.write().map_err(|_| Error::Panic)?;
+            let mut db_cmp = self.env.db_cmp.write().map_err(|_| Error::Panic)?;
+            let mut db_dcmp = self.env.db_dcmp.write().map_err(|_| Error::Panic)?;
+            let mut db_flags_vec = self.env.db_flags.write().map_err(|_| Error::Panic)?;
 
-        while db_names.len() <= dbi {
-            db_names.push(None);
-            db_cmp.push(Arc::new(default_cmp(0)));
-            db_dcmp.push(Arc::new(default_dcmp(0)));
-            db_flags_vec.push(0);
+            while db_names.len() <= dbi {
+                db_names.push(None);
+                db_cmp.push(Arc::new(default_cmp(0)));
+                db_dcmp.push(Arc::new(default_dcmp(0)));
+                db_flags_vec.push(0);
+            }
+
+            db_names[dbi] = Some(name.to_string());
+            db_cmp[dbi] = Arc::new(default_cmp(db.flags));
+            db_dcmp[dbi] = Arc::new(default_dcmp(db.flags));
+            db_flags_vec[dbi] = db.flags;
         }
-
-        db_names[dbi] = Some(name.to_string());
-        db_cmp[dbi] = Arc::new(default_cmp(db.flags));
-        db_dcmp[dbi] = Arc::new(default_dcmp(db.flags));
-        db_flags_vec[dbi] = db.flags;
 
         // Extend local dbs array.
         while self.dbs.len() <= dbi {
             self.dbs.push(DbStat::default());
         }
         self.dbs[dbi] = db;
+
+        // Keep the local cmp cache in sync with the env.
+        self.refresh_cmp_cache()?;
 
         Ok(dbi as u32)
     }
@@ -315,6 +349,12 @@ impl std::fmt::Debug for RoTransaction<'_> {
 pub struct RoCursor<'txn, 'env> {
     txn: &'txn RoTransaction<'env>,
     cursor: Cursor,
+    /// Cached key comparator, populated at `open_cursor`. Avoids a per-op
+    /// RwLock acquire + Arc clone on the hot path.
+    cmp: Arc<Box<CmpFn>>,
+    /// Cached "this DB has DUP_SORT" flag. Lets non-DUPSORT databases skip
+    /// dup-count bookkeeping entirely.
+    is_dupsort: bool,
     /// Current dup index within a DUPSORT sub-page (0 for non-dup databases).
     dup_idx: usize,
     /// Total dup count at the current key position (1 for non-dup databases).
@@ -330,28 +370,42 @@ impl<'txn, 'env> RoCursor<'txn, 'env> {
     /// Returns [`Error::NotFound`] when the cursor reaches the end or the
     /// requested key is not found.
     pub fn get(&mut self, key: Option<&[u8]>, op: CursorOp) -> Result<(&'txn [u8], &'txn [u8])> {
+        // Fast path for the most common op — Next on a non-DUPSORT database.
+        // Skips the full match, avoids sync_dup_count + current_node
+        // reconstruction. This is the seq_scan / range_scan hot path.
+        if !self.is_dupsort && matches!(op, CursorOp::Next) {
+            let get_page = |pgno: u64| self.txn.env.get_page(pgno);
+            self.cursor.next(&get_page)?;
+            return self.current_kv_nondup();
+        }
+
         let db = self.txn.db(self.cursor.dbi)?;
         let root = db.root;
-        let cmp = self.txn.env.get_cmp(self.cursor.dbi)?;
+        let cmp: &CmpFn = &**self.cmp;
         let get_page = |pgno: u64| self.txn.env.get_page(pgno);
 
         match op {
             CursorOp::First => {
-                self.cursor.first(root, &*cmp, &get_page)?;
+                self.cursor.first(root, cmp, &get_page)?;
                 self.dup_idx = 0;
-                self.sync_dup_count();
+                if self.is_dupsort {
+                    self.sync_dup_count();
+                }
             }
             CursorOp::Last => {
-                self.cursor.last(root, &*cmp, &get_page)?;
-                self.sync_dup_count();
-                self.dup_idx = self.dup_count.saturating_sub(1);
+                self.cursor.last(root, cmp, &get_page)?;
+                if self.is_dupsort {
+                    self.sync_dup_count();
+                    self.dup_idx = self.dup_count.saturating_sub(1);
+                } else {
+                    self.dup_idx = 0;
+                }
             }
             CursorOp::Next => {
+                // Only reached for DUPSORT (non-dup fast-pathed above).
                 if self.dup_count > 1 && self.dup_idx + 1 < self.dup_count {
-                    // Move to next dup of the same key.
                     self.dup_idx += 1;
                 } else {
-                    // Move to the next key.
                     self.cursor.next(&get_page)?;
                     self.dup_idx = 0;
                     self.sync_dup_count();
@@ -360,7 +414,9 @@ impl<'txn, 'env> RoCursor<'txn, 'env> {
             CursorOp::NextNoDup => {
                 self.cursor.next(&get_page)?;
                 self.dup_idx = 0;
-                self.sync_dup_count();
+                if self.is_dupsort {
+                    self.sync_dup_count();
+                }
             }
             CursorOp::NextDup => {
                 if self.dup_idx + 1 < self.dup_count {
@@ -371,18 +427,22 @@ impl<'txn, 'env> RoCursor<'txn, 'env> {
             }
             CursorOp::Prev => {
                 if self.dup_count > 1 && self.dup_idx > 0 {
-                    // Move to previous dup of the same key.
                     self.dup_idx -= 1;
                 } else {
-                    // Move to the previous key.
                     self.cursor.prev(&get_page)?;
-                    self.sync_dup_count();
-                    self.dup_idx = self.dup_count.saturating_sub(1);
+                    if self.is_dupsort {
+                        self.sync_dup_count();
+                        self.dup_idx = self.dup_count.saturating_sub(1);
+                    } else {
+                        self.dup_idx = 0;
+                    }
                 }
             }
             CursorOp::PrevNoDup => {
                 self.cursor.prev(&get_page)?;
-                self.sync_dup_count();
+                if self.is_dupsort {
+                    self.sync_dup_count();
+                }
                 self.dup_idx = 0;
             }
             CursorOp::PrevDup => {
@@ -402,23 +462,29 @@ impl<'txn, 'env> RoCursor<'txn, 'env> {
                 if !self.cursor.is_initialized() {
                     return Err(Error::NotFound);
                 }
-                self.sync_dup_count();
-                self.dup_idx = self.dup_count.saturating_sub(1);
+                if self.is_dupsort {
+                    self.sync_dup_count();
+                    self.dup_idx = self.dup_count.saturating_sub(1);
+                }
             }
             CursorOp::Set | CursorOp::SetKey => {
                 let k = key.ok_or(Error::BadValSize)?;
-                self.cursor.set(root, k, &*cmp, &get_page)?;
+                self.cursor.set(root, k, cmp, &get_page)?;
                 self.dup_idx = 0;
-                self.sync_dup_count();
+                if self.is_dupsort {
+                    self.sync_dup_count();
+                }
             }
             CursorOp::SetRange => {
                 let k = key.ok_or(Error::BadValSize)?;
-                self.cursor.page_search(root, Some(k), &*cmp, &get_page)?;
+                self.cursor.page_search(root, Some(k), cmp, &get_page)?;
                 if self.cursor.current_key().is_none() {
                     return Err(Error::NotFound);
                 }
                 self.dup_idx = 0;
-                self.sync_dup_count();
+                if self.is_dupsort {
+                    self.sync_dup_count();
+                }
             }
             CursorOp::GetCurrent => {
                 if !self.cursor.is_initialized() {
@@ -427,24 +493,30 @@ impl<'txn, 'env> RoCursor<'txn, 'env> {
             }
             CursorOp::GetBoth => {
                 let k = key.ok_or(Error::BadValSize)?;
-                self.cursor.set(root, k, &*cmp, &get_page)?;
+                self.cursor.set(root, k, cmp, &get_page)?;
                 // GetBoth is not fully supported without a data parameter;
                 // position at the key only.
                 self.dup_idx = 0;
-                self.sync_dup_count();
+                if self.is_dupsort {
+                    self.sync_dup_count();
+                }
             }
             CursorOp::GetBothRange => {
                 let k = key.ok_or(Error::BadValSize)?;
-                self.cursor.set(root, k, &*cmp, &get_page)?;
+                self.cursor.set(root, k, cmp, &get_page)?;
                 self.dup_idx = 0;
-                self.sync_dup_count();
+                if self.is_dupsort {
+                    self.sync_dup_count();
+                }
             }
             CursorOp::GetMultiple | CursorOp::NextMultiple => {
                 if op == CursorOp::NextMultiple {
                     // Advance to the next key first.
                     self.cursor.next(&get_page)?;
                     self.dup_idx = 0;
-                    self.sync_dup_count();
+                    if self.is_dupsort {
+                        self.sync_dup_count();
+                    }
                 } else if !self.cursor.is_initialized() {
                     return Err(Error::NotFound);
                 }
@@ -453,12 +525,36 @@ impl<'txn, 'env> RoCursor<'txn, 'env> {
             CursorOp::PrevMultiple => {
                 self.cursor.prev(&get_page)?;
                 self.dup_idx = 0;
-                self.sync_dup_count();
+                if self.is_dupsort {
+                    self.sync_dup_count();
+                }
                 return self.get_multiple_kv();
             }
         }
 
         self.current_kv()
+    }
+
+    /// Fast-path `current_kv` for non-DUPSORT databases — avoids the
+    /// `is_dupdata()` branch (always false) and saves a check per call.
+    fn current_kv_nondup(&self) -> Result<(&'txn [u8], &'txn [u8])> {
+        let node = self.cursor.current_node().ok_or(Error::NotFound)?;
+        // SAFETY: node data comes from mmap owned by env (outlives 'txn).
+        let key: &'txn [u8] = unsafe { std::mem::transmute::<&[u8], &[u8]>(node.key()) };
+
+        let data: &'txn [u8] = if node.is_bigdata() {
+            let pgno = node.overflow_pgno();
+            let ptr = self.txn.env.get_page(pgno)?;
+            let data_size = node.data_size() as usize;
+            unsafe {
+                let start = ptr.add(PAGE_HEADER_SIZE);
+                std::mem::transmute::<&[u8], &[u8]>(std::slice::from_raw_parts(start, data_size))
+            }
+        } else {
+            unsafe { std::mem::transmute::<&[u8], &[u8]>(node.node_data()) }
+        };
+
+        Ok((key, data))
     }
 
     /// Return all DUPFIXED values at the current position as a contiguous
