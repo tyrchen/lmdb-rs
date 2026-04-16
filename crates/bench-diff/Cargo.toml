@@ -1,0 +1,15 @@
+[package]
+name = "bench-diff"
+description = "Criterion baseline diff tool — fails if any bench regresses beyond the configured threshold"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "bench-diff"
+path = "src/main.rs"
+
+[dependencies]

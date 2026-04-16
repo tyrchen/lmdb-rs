@@ -39,8 +39,13 @@ bench-baseline: ## snapshot current numbers under NAME=<tag>
 	@test -n "$(NAME)" || (echo "usage: make bench-baseline NAME=<tag>" && exit 1)
 	@cargo bench -p lmdb-rs-core -- --save-baseline $(NAME)
 
-bench-regress: ## compare against NAME=<tag>, fail on regression
+bench-regress: ## compare against NAME=<tag>, fail on regression (5% default)
 	@test -n "$(NAME)" || (echo "usage: make bench-regress NAME=<tag>" && exit 1)
 	@cargo bench -p lmdb-rs-core -- --baseline $(NAME)
+	@cargo run -p bench-diff --release --quiet -- --baseline $(NAME) --threshold 5.0
 
-.PHONY: build test release update-submodule bench bench-compare bench-quick bench-baseline bench-regress
+bench-diff: ## just run the diff tool against NAME=<tag>
+	@test -n "$(NAME)" || (echo "usage: make bench-diff NAME=<tag>" && exit 1)
+	@cargo run -p bench-diff --release --quiet -- --baseline $(NAME) --threshold 5.0
+
+.PHONY: build test release update-submodule bench bench-compare bench-quick bench-baseline bench-regress bench-diff

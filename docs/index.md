@@ -3,6 +3,7 @@
 ## Guides
 
 - [Developer Guide](dev-guide.md) — Architecture, internals, build instructions, and contributor reference for lmdb-rs
+- [Benchmarks](bench/README.md) — How to run, save baselines, and gate CI on regressions
 
 ## Research
 
