@@ -213,6 +213,37 @@ struct SavePoint {
 }
 
 // ---------------------------------------------------------------------------
+// PutHint
+// ---------------------------------------------------------------------------
+
+/// Cached leaf reference from the most recent put on a given database.
+///
+/// The idea: sequential / append-style writers land on the same rightmost
+/// leaf repeatedly. Walking root-to-leaf every time is 90% wasted work
+/// once the tree has more than a leaf's worth of data. This hint lets
+/// `cursor_put` skip the walk when it's safe — i.e. when
+///
+/// * the target leaf from the previous put is known (`leaf_pgno`),
+/// * every branch hop during that walk picked the rightmost child (`is_rightmost`) — so there is no
+///   right-sibling leaf whose keyspace we could accidentally stomp on,
+/// * the root page hasn't been replaced since (`root_pgno` matches `dbs[dbi].root`),
+/// * the new key is strictly greater than any key we've placed here (`last_key`) — so there's no
+///   duplicate and insertion belongs at position `nkeys`.
+///
+/// Any mutation the fast-path can't reason about (delete, reserve,
+/// DUPSORT put, nested-txn rollback, cursor-level mutation) invalidates
+/// the hint. It is only *populated* after the slow path has already
+/// validated the invariants the fast-path relies on.
+#[derive(Debug)]
+pub(crate) struct PutHint {
+    pub(crate) dbi: u32,
+    pub(crate) root_pgno: u64,
+    pub(crate) leaf_pgno: u64,
+    pub(crate) is_rightmost: bool,
+    pub(crate) last_key: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
 // RwTransaction
 // ---------------------------------------------------------------------------
 
@@ -259,6 +290,9 @@ pub struct RwTransaction<'env> {
     pub(crate) cmp_cache: Vec<Arc<Box<crate::cmp::CmpFn>>>,
     /// Local snapshot of the env's per-dbi data comparators (DUPSORT).
     pub(crate) dcmp_cache: Vec<Arc<Box<crate::cmp::CmpFn>>>,
+    /// Leaf hint from the most recent put — lets subsequent monotonic
+    /// puts skip the full root-to-leaf walk. See [`PutHint`].
+    pub(crate) put_hint: Option<PutHint>,
     /// Writer mutex guard — held for the entire transaction lifetime.
     /// Ensures only one writer at a time within this process.
     _write_guard: std::sync::MutexGuard<'env, ()>,
@@ -324,8 +358,17 @@ impl<'env> RwTransaction<'env> {
             savepoints: Vec::new(),
             cmp_cache,
             dcmp_cache,
+            put_hint: None,
             _write_guard: write_guard,
         })
+    }
+
+    /// Drop any cached leaf hint. Called at the top of operations that
+    /// may move/reshape leaves in ways the fast path can't predict
+    /// (delete, reserve, open_db, nested txn ops, cursor mutation).
+    #[inline]
+    pub(crate) fn invalidate_put_hint(&mut self) {
+        self.put_hint = None;
     }
 
     /// Borrow the cached key comparator for `dbi`. Cheap — no lock, no clone.
@@ -550,6 +593,10 @@ impl<'env> RwTransaction<'env> {
             if self.env.max_dbs == 0 {
                 return Err(Error::BadDbi);
             }
+            // Registering a named DB may write a SUBDATA record into
+            // MAIN_DBI; that mutation would invalidate any MAIN_DBI hint.
+            // Easier to drop it unconditionally than to reason about when.
+            self.invalidate_put_hint();
             self.find_or_create_db(name, flags)
         } else {
             Ok(MAIN_DBI as u32)
@@ -836,6 +883,7 @@ impl<'env> RwTransaction<'env> {
     /// - [`Error::NotFound`] if the key (or specific dup) does not exist
     /// - [`Error::BadDbi`] if `dbi` is invalid
     pub fn del(&mut self, dbi: u32, key: &[u8], data: Option<&[u8]>) -> Result<()> {
+        self.invalidate_put_hint();
         btree::cursor_del(self, dbi, key, data)
     }
 
@@ -850,6 +898,7 @@ impl<'env> RwTransaction<'env> {
     /// Returns [`Error::Incompatible`] if attempting to drop a core database.
     /// Returns [`Error::BadDbi`] if `dbi` is invalid.
     pub fn drop_db(&mut self, dbi: u32, del: bool) -> Result<()> {
+        self.invalidate_put_hint();
         if dbi < CORE_DBS {
             return Err(Error::Incompatible);
         }
@@ -958,6 +1007,10 @@ impl<'env> RwTransaction<'env> {
     /// The cursor supports positional navigation, put, and delete operations.
     pub fn open_rw_cursor(&mut self, dbi: u32) -> Result<RwCursor<'_, 'env>> {
         let _ = self.dbs.get(dbi as usize).ok_or(Error::BadDbi)?;
+        // Cursor-level mutations take their own path through cursor_put /
+        // cursor_del and can't keep the txn's leaf hint in sync. Drop it so
+        // subsequent `txn.put` falls back to a correct slow-path walk.
+        self.invalidate_put_hint();
         Ok(RwCursor {
             cursor: Cursor::new(self.env.page_size, dbi),
             txn: self,
@@ -1104,6 +1157,7 @@ impl<'env> RwTransaction<'env> {
         if self.finished {
             return Err(Error::BadTxn);
         }
+        self.invalidate_put_hint();
         let savepoint = SavePoint {
             dbs: self.dbs.clone(),
             db_dirty: self.db_dirty.clone(),
@@ -1144,6 +1198,7 @@ impl<'env> RwTransaction<'env> {
     /// Returns [`Error::BadTxn`] if there is no active nested transaction.
     pub fn abort_nested_txn(&mut self) -> Result<()> {
         let sp = self.savepoints.pop().ok_or(Error::BadTxn)?;
+        self.invalidate_put_hint();
         self.dbs = sp.dbs;
         self.db_dirty = sp.db_dirty;
         self.free_pgs = sp.free_pgs;
@@ -1189,6 +1244,9 @@ impl<'env> RwTransaction<'env> {
     /// Returns [`Error::BadDbi`] if `dbi` is out of range.
     /// Returns [`Error::Panic`] if the internal lock is poisoned.
     pub fn set_compare(&mut self, dbi: u32, cmp: Box<crate::cmp::CmpFn>) -> Result<()> {
+        // Changing the comparator invalidates the `key > last_key`
+        // semantics the hint relies on.
+        self.invalidate_put_hint();
         let arc = Arc::new(cmp);
         {
             let mut db_cmp = self.env.db_cmp.write().map_err(|_| Error::Panic)?;
@@ -1216,6 +1274,7 @@ impl<'env> RwTransaction<'env> {
     /// Returns [`Error::BadDbi`] if `dbi` is out of range.
     /// Returns [`Error::Panic`] if the internal lock is poisoned.
     pub fn set_dupsort(&mut self, dbi: u32, cmp: Box<crate::cmp::CmpFn>) -> Result<()> {
+        self.invalidate_put_hint();
         let arc = Arc::new(cmp);
         {
             let mut db_dcmp = self.env.db_dcmp.write().map_err(|_| Error::Panic)?;

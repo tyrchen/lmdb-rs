@@ -14,7 +14,7 @@ use crate::{
     node::{init_page, leaf_size, node_add, node_add_bigdata, node_del},
     page::{Page, even},
     types::*,
-    write::{PageBuf, RwTransaction, db_stat_to_bytes},
+    write::{PageBuf, PutHint, RwTransaction, db_stat_to_bytes},
 };
 
 // ---------------------------------------------------------------------------
@@ -270,6 +270,21 @@ pub fn cursor_put_with_flags(
         db_mut.leaf_pages = 1;
         db_mut.entries = 1;
         txn.db_dirty[dbi as usize] = true;
+
+        // Single-leaf tree, trivially rightmost — populate hint so the very
+        // next put can fast-path, not just the third-and-beyond one.
+        if !needs_overflow {
+            let db_is_dupsort = db.flags & DatabaseFlags::DUP_SORT.bits() as u16 != 0;
+            if !db_is_dupsort {
+                txn.put_hint = Some(PutHint {
+                    dbi,
+                    root_pgno,
+                    leaf_pgno: root_pgno,
+                    is_rightmost: true,
+                    last_key: key.to_vec(),
+                });
+            }
+        }
         return Ok(());
     }
 
@@ -286,7 +301,64 @@ pub fn cursor_put_with_flags(
         return append_put(txn, dbi, key, data, node_flags, needs_overflow, &cmp);
     }
 
-    let (path, leaf_pgno) = walk_and_touch(txn, db.root, key, &**cmp)?;
+    // Leaf-hint fast path — monotonic / append-style workloads repeatedly
+    // hit the same rightmost leaf. When the previous put left a valid
+    // hint, skip the root-to-leaf walk entirely.
+    let db_is_dupsort_check = db.flags & DatabaseFlags::DUP_SORT.bits() as u16 != 0;
+    if !db_is_dupsort_check && !needs_overflow && !flags.contains(WriteFlags::NO_DUP_DATA) {
+        let hint_leaf = match &txn.put_hint {
+            Some(h)
+                if h.dbi == dbi
+                    && h.root_pgno == db.root
+                    && h.is_rightmost
+                    && (**cmp)(key, &h.last_key) == Ordering::Greater =>
+            {
+                Some(h.leaf_pgno)
+            }
+            _ => None,
+        };
+
+        if let Some(leaf_pgno) = hint_leaf {
+            if let Some(buf) = txn.dirty.find_mut(leaf_pgno) {
+                let insert_idx = buf.as_page().num_keys();
+                let add = node_add(
+                    buf.as_mut_slice(),
+                    page_size,
+                    insert_idx,
+                    key,
+                    data,
+                    0,
+                    node_flags,
+                );
+                match add {
+                    Ok(()) => {
+                        let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+                        db_mut.entries += 1;
+                        txn.db_dirty[dbi as usize] = true;
+                        // We appended at the end of a rightmost leaf —
+                        // refresh last_key in-place without dropping the hint.
+                        if let Some(h) = txn.put_hint.as_mut() {
+                            h.last_key.clear();
+                            h.last_key.extend_from_slice(key);
+                        }
+                        return Ok(());
+                    }
+                    Err(Error::PageFull) => {
+                        // Leaf is full — we need a split. Invalidate the
+                        // hint; the slow path below will re-populate if the
+                        // split's target leaf is still rightmost.
+                        txn.put_hint = None;
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                // Leaf was evicted (page spill) — drop the hint.
+                txn.put_hint = None;
+            }
+        }
+    }
+
+    let (path, leaf_pgno, is_rightmost) = walk_and_touch(txn, db.root, key, &**cmp)?;
 
     // Try to insert on the leaf page.
     let leaf_buf = txn.dirty.find(leaf_pgno).ok_or(Error::Corrupted)?;
@@ -345,6 +417,9 @@ pub fn cursor_put_with_flags(
                     db_mut.entries += 1;
                 }
                 txn.db_dirty[dbi as usize] = true;
+                // Overflow put — don't bother with the hint (fast path
+                // requires !needs_overflow anyway).
+                txn.put_hint = None;
                 Ok(())
             }
             Err(Error::PageFull) => {
@@ -366,6 +441,7 @@ pub fn cursor_put_with_flags(
                     db_mut.entries += 1;
                 }
                 txn.db_dirty[dbi as usize] = true;
+                txn.put_hint = None;
                 Ok(())
             }
             Err(e) => Err(e),
@@ -391,6 +467,21 @@ pub fn cursor_put_with_flags(
                     db_mut.entries += 1;
                 }
                 txn.db_dirty[dbi as usize] = true;
+                // Populate the leaf hint if (a) we appended at the end of a
+                // rightmost leaf, (b) no overflow, (c) not DUPSORT, (d) not
+                // overwriting. These are the conditions the fast-path check
+                // later relies on.
+                if is_rightmost && !overwrite && !db_is_dupsort && insert_idx == nkeys {
+                    txn.put_hint = Some(PutHint {
+                        dbi,
+                        root_pgno: path[0].pgno,
+                        leaf_pgno,
+                        is_rightmost: true,
+                        last_key: key.to_vec(),
+                    });
+                } else {
+                    txn.put_hint = None;
+                }
                 Ok(())
             }
             Err(Error::PageFull) => {
@@ -400,6 +491,10 @@ pub fn cursor_put_with_flags(
                     db_mut.entries += 1;
                 }
                 txn.db_dirty[dbi as usize] = true;
+                // Splits change the tree shape — invalidate the hint. The
+                // next put will re-walk and, if it lands on a rightmost
+                // leaf, re-populate.
+                txn.put_hint = None;
                 Ok(())
             }
             Err(e) => Err(e),
@@ -438,7 +533,7 @@ pub fn cursor_del(
     let page_size = txn.env.page_size;
 
     // Walk the tree, COW-ing each page.
-    let (path, leaf_pgno) = walk_and_touch(txn, db.root, key, &**cmp)?;
+    let (path, leaf_pgno, _is_rightmost) = walk_and_touch(txn, db.root, key, &**cmp)?;
 
     // Verify exact match.
     let leaf_buf = txn.dirty.find(leaf_pgno).ok_or(Error::Corrupted)?;
@@ -697,16 +792,22 @@ fn walk_to_last(txn: &mut RwTransaction<'_>, root_pgno: u64) -> Result<(TreePath
 
 /// Walk from root to the leaf containing `key`, COW-ing each page.
 ///
-/// Returns the path from root to leaf and the leaf page number. Each page
-/// along the path is guaranteed to be in the dirty list after this call.
+/// Returns `(path, leaf_pgno, is_rightmost)`. `is_rightmost` is true when
+/// every branch-level descent took the rightmost child — the caller uses
+/// this to decide whether a subsequent put can fast-path to this leaf
+/// (there is no right-sibling leaf that could own a still-larger key).
+///
+/// Each page along the path is guaranteed to be in the dirty list after
+/// this call.
 fn walk_and_touch(
     txn: &mut RwTransaction<'_>,
     root_pgno: u64,
     key: &[u8],
     cmp: &CmpFn,
-) -> Result<(TreePath, u64)> {
+) -> Result<(TreePath, u64, bool)> {
     let page_size = txn.env.page_size;
     let mut path = TreePath::new();
+    let mut is_rightmost = true;
 
     // Touch the root page.
     let mut current_pgno = txn.page_touch(root_pgno)?;
@@ -719,7 +820,7 @@ fn walk_and_touch(
                 pgno: current_pgno,
                 idx: 0,
             });
-            return Ok((path, current_pgno));
+            return Ok((path, current_pgno, is_rightmost));
         }
 
         if !page.is_branch() {
@@ -727,6 +828,7 @@ fn walk_and_touch(
         }
 
         // Search for the child to descend into.
+        let nkeys = page.num_keys();
         let (idx, exact) = page_node_search(&page, key, cmp);
         let child_idx = if exact {
             idx
@@ -735,6 +837,12 @@ fn walk_and_touch(
         } else {
             0
         };
+
+        // We stay on the rightmost spine only if every branch descent picks
+        // the rightmost child.
+        if child_idx + 1 != nkeys {
+            is_rightmost = false;
+        }
 
         path.push(PathLevel {
             pgno: current_pgno,
@@ -2228,7 +2336,7 @@ fn insert_into_sub_db_tree(
     }
 
     // Walk the sub-DB tree from root to leaf, COW-ing each page.
-    let (path, leaf_pgno) = walk_and_touch(txn, sub_db.root, val, &*cmp)?;
+    let (path, leaf_pgno, _is_rightmost) = walk_and_touch(txn, sub_db.root, val, &*cmp)?;
 
     // Find insertion point.
     let leaf_buf = txn.dirty.find(leaf_pgno).ok_or(Error::Corrupted)?;
