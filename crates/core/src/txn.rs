@@ -137,14 +137,18 @@ impl<'env> RoTransaction<'env> {
     ///
     /// Returns [`Error::BadDbi`] if `dbi` is invalid.
     pub fn open_cursor(&self, dbi: u32) -> Result<RoCursor<'_, 'env>> {
-        let _db = self.db(dbi)?;
+        let db = self.db(dbi)?;
         let cursor = Cursor::new(self.env.page_size, dbi);
-        // Cache cmp + db_flags once at open — hot-path ops (Next on a
-        // seq_scan) avoid the env.get_cmp RwLock acquire + Arc clone that
-        // would otherwise cost 20-30 ns per call.
-        let cmp = self.env.get_cmp(dbi)?;
-        let db_flags = self.env.get_db_flags(dbi)?;
-        let is_dupsort = db_flags & DatabaseFlags::DUP_SORT.bits() as u16 != 0;
+        // Pull cmp directly from the txn's local cache — no RwLock. We
+        // snapshotted it at txn construction, so it's already present here.
+        let cmp = self
+            .cmp_cache
+            .get(dbi as usize)
+            .ok_or(Error::BadDbi)?
+            .clone();
+        // `db.flags` mirrors the env's db_flags for this dbi — skip a
+        // second RwLock acquire.
+        let is_dupsort = db.flags & DatabaseFlags::DUP_SORT.bits() as u16 != 0;
         Ok(RoCursor {
             txn: self,
             cursor,
