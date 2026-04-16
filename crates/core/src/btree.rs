@@ -54,6 +54,127 @@ struct BranchEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Size-aware split point calculation
+// ---------------------------------------------------------------------------
+
+/// Compute the on-page size of a single leaf entry (node header + key + inline
+/// data + the 2-byte pointer slot).
+fn leaf_entry_size(entry: &LeafEntry) -> usize {
+    let data_len = if entry.flags.contains(NodeFlags::BIGDATA) {
+        // Overflow pointer is a pgno stored inline (8 bytes).
+        size_of::<u64>()
+    } else {
+        entry.data.len()
+    };
+    even(NODE_HEADER_SIZE + entry.key.len() + data_len) + size_of::<u16>()
+}
+
+/// Compute the on-page size of a single branch entry.
+fn branch_entry_size(entry: &BranchEntry) -> usize {
+    even(NODE_HEADER_SIZE + entry.key.len()) + size_of::<u16>()
+}
+
+/// Find the optimal split point for a leaf page using size-aware splitting.
+///
+/// Mirrors the C LMDB algorithm: if the page has few keys, contains a large
+/// new item, or the new item is appended at the end, we accumulate node sizes
+/// from one side and split where the page fills up instead of splitting by
+/// count.
+fn find_leaf_split_point(
+    entries: &[LeafEntry],
+    insert_idx: usize,
+    new_entry_size: usize,
+    page_size: usize,
+) -> usize {
+    let total = entries.len();
+    let default_split = total.div_ceil(2);
+    let pmax = page_size - PAGE_HEADER_SIZE;
+    let key_thresh = page_size >> 7;
+
+    // Decide whether size-aware splitting is needed.
+    let need_size_split = total < key_thresh || new_entry_size > pmax / 16 || insert_idx >= total;
+
+    if !need_size_split {
+        return default_split;
+    }
+
+    // Scan from the left, accumulating sizes until we exceed half the page.
+    if insert_idx <= default_split || insert_idx >= total {
+        // Scan left-to-right up to default_split + 1.
+        let k = if insert_idx >= total {
+            total
+        } else {
+            default_split + 1
+        };
+        let mut psize = 0usize;
+        for (i, entry) in entries[..k].iter().enumerate() {
+            psize += leaf_entry_size(entry);
+            if psize > pmax {
+                return i;
+            }
+        }
+        // All entries up to k fit; use default.
+        default_split
+    } else {
+        // Scan right-to-left from the end down to default_split - 1.
+        let k = default_split.saturating_sub(1);
+        let mut psize = 0usize;
+        for (i, entry) in entries[k + 1..total].iter().enumerate().rev() {
+            psize += leaf_entry_size(entry);
+            if psize > pmax {
+                return k + 1 + i + 1;
+            }
+        }
+        default_split
+    }
+}
+
+/// Find the optimal split point for a branch page using size-aware splitting.
+fn find_branch_split_point(
+    entries: &[BranchEntry],
+    insert_idx: usize,
+    new_entry_size: usize,
+    page_size: usize,
+) -> usize {
+    let total = entries.len();
+    let default_split = total.div_ceil(2);
+    let pmax = page_size - PAGE_HEADER_SIZE;
+    let key_thresh = page_size >> 7;
+
+    let need_size_split = total < key_thresh || new_entry_size > pmax / 16 || insert_idx >= total;
+
+    if !need_size_split {
+        return default_split;
+    }
+
+    if insert_idx <= default_split || insert_idx >= total {
+        let k = if insert_idx >= total {
+            total
+        } else {
+            default_split + 1
+        };
+        let mut psize = 0usize;
+        for (i, entry) in entries[..k].iter().enumerate() {
+            psize += branch_entry_size(entry);
+            if psize > pmax {
+                return i;
+            }
+        }
+        default_split
+    } else {
+        let k = default_split.saturating_sub(1);
+        let mut psize = 0usize;
+        for (i, entry) in entries[k + 1..total].iter().enumerate().rev() {
+            psize += branch_entry_size(entry);
+            if psize > pmax {
+                return k + 1 + i + 1;
+            }
+        }
+        default_split
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -771,8 +892,8 @@ fn split_and_insert(
         },
     );
 
-    let total = entries.len();
-    let split_idx = total / 2;
+    let new_entry_size = leaf_entry_size(&entries[insert_idx]);
+    let split_idx = find_leaf_split_point(&entries, insert_idx, new_entry_size, page_size);
 
     // Allocate right sibling leaf.
     let (right_pgno, mut right_buf) = txn.page_alloc()?;
@@ -953,8 +1074,8 @@ fn split_branch(
         },
     );
 
-    let total = entries.len();
-    let split_idx = total / 2;
+    let new_entry_size = branch_entry_size(&entries[insert_idx]);
+    let split_idx = find_branch_split_point(&entries, insert_idx, new_entry_size, page_size);
 
     // The separator for the parent is the key at the split point.
     // For branch splits, the key at split_idx is promoted (not duplicated).
@@ -1575,8 +1696,8 @@ fn split_and_insert_bigdata(
         },
     );
 
-    let total = entries.len();
-    let split_idx = total / 2;
+    let new_entry_size = leaf_entry_size(&entries[insert_idx]);
+    let split_idx = find_leaf_split_point(&entries, insert_idx, new_entry_size, page_size);
 
     // Allocate right sibling leaf.
     let (right_pgno, mut right_buf) = txn.page_alloc()?;
@@ -2174,8 +2295,8 @@ fn split_and_insert_sub_db(
         },
     );
 
-    let total = entries.len();
-    let split_idx = total / 2;
+    let new_entry_size = leaf_entry_size(&entries[insert_idx]);
+    let split_idx = find_leaf_split_point(&entries, insert_idx, new_entry_size, page_size);
 
     // Allocate right sibling leaf.
     let (right_pgno, mut right_buf) = txn.page_alloc()?;
@@ -2342,8 +2463,8 @@ fn split_branch_sub_db(
         },
     );
 
-    let total = entries.len();
-    let split_idx = total / 2;
+    let new_entry_size = branch_entry_size(&entries[insert_idx]);
+    let split_idx = find_branch_split_point(&entries, insert_idx, new_entry_size, page_size);
     let promoted_key = entries[split_idx].key.clone();
 
     let (right_pgno, mut right_buf) = txn.page_alloc()?;
