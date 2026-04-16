@@ -28,3 +28,27 @@ rand_distr = "0.5"
 [[bench]]
 name = "bench_read"
 harness = false
+
+[[bench]]
+name = "bench_write"
+harness = false
+
+[[bench]]
+name = "bench_cursor"
+harness = false
+
+[[bench]]
+name = "bench_dupsort"
+harness = false
+
+[[bench]]
+name = "bench_txn"
+harness = false
+
+[[bench]]
+name = "bench_scaling"
+harness = false
+
+[[bench]]
+name = "bench_admin"
+harness = false
