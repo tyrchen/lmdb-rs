@@ -390,10 +390,16 @@ impl Cursor {
     where
         F: Fn(u64) -> Result<*const u8>,
     {
-        // Iteratively ascend the tree until we find a parent with a sibling
-        // in the requested direction.
+        // Ascend the tree until we find a parent with a sibling in the
+        // requested direction.
         loop {
             if self.snum < 2 {
+                // No more ancestors — already at the first/last page. The
+                // caller (next/prev) will observe NotFound; leave the cursor
+                // de-initialized so a subsequent op re-seeks from the root
+                // rather than trusting a half-unwound stack.
+                self.flags
+                    .remove(CursorFlags::INITIALIZED | CursorFlags::EOF);
                 return Err(Error::NotFound);
             }
 
@@ -418,23 +424,50 @@ impl Cursor {
             }
         }
 
-        // Descend into the sibling child.
-        let page = self.current_page();
-        let new_idx = self.indices[self.top as usize] as usize;
-        let child_pgno = page.node(new_idx).child_pgno();
-        let child_ptr = get_page(child_pgno)?;
-        self.push_page(child_ptr);
+        // Post-ascent invariant: after popping we must be on a branch page,
+        // because every non-leaf level in a B+ tree is a branch and we only
+        // ever ascend from leaves. Mirrors C LMDB's `mdb_cassert(IS_BRANCH)`.
+        debug_assert!(
+            self.current_page().is_branch(),
+            "sibling ascent did not land on a branch page",
+        );
 
-        // Position at the first or last key of the new sibling page.
-        let new_page = self.current_page();
-        let nk = new_page.num_keys();
-        self.indices[self.top as usize] = if right {
-            0
-        } else if nk > 0 {
-            (nk - 1) as u16
-        } else {
-            0
-        };
+        // Descend into the sibling child, then keep descending to a leaf.
+        // When we ascended more than one level to find a sibling, the first
+        // descent lands us on an internal branch page — we must walk down
+        // the leftmost (for `right`) or rightmost (for `!right`) path until
+        // we reach a leaf.
+        loop {
+            let page = self.current_page();
+            let new_idx = self.indices[self.top as usize] as usize;
+            let child_pgno = page.node(new_idx).child_pgno();
+            let child_ptr = match get_page(child_pgno) {
+                Ok(p) => p,
+                Err(e) => {
+                    // Descent failed mid-walk. The stack is partially
+                    // rewritten; future ops cannot trust it. De-initialize
+                    // so the next op re-seeks from the root.
+                    self.flags
+                        .remove(CursorFlags::INITIALIZED | CursorFlags::EOF);
+                    return Err(e);
+                }
+            };
+            self.push_page(child_ptr);
+
+            let new_page = self.current_page();
+            let nk = new_page.num_keys();
+            self.indices[self.top as usize] = if right {
+                0
+            } else if nk > 0 {
+                (nk - 1) as u16
+            } else {
+                0
+            };
+
+            if new_page.is_leaf() {
+                break;
+            }
+        }
 
         Ok(())
     }

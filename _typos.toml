@@ -1,4 +1,8 @@
 [default.extend-words]
+# "abd" appears in byte-string literals in cmp doc-tests as a value that
+# must sort after "abc" — not a typo for "and".
+abd = "abd"
 
 [files]
-extend-exclude = ["CHANGELOG.md"]
+# vendors/ contains upstream C LMDB source (submodule); not ours to edit.
+extend-exclude = ["CHANGELOG.md", "vendors/**"]
