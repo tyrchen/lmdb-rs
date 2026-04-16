@@ -1,0 +1,16 @@
+[package]
+name = "bench-compat"
+description = "FFI adapter over lmdb-master-sys for benchmark parity testing"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+lmdb-master-sys = "=0.2.6"
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
