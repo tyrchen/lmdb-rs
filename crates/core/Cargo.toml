@@ -18,12 +18,20 @@ memmap2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# Optional because its build.rs compiles the vendored C LMDB source. Pulled
+# in only by the `bench-compare` feature used by `bench_compare.rs`.
+bench-compat = { path = "../bench-compat", optional = true }
+
 [dev-dependencies]
 tempfile.workspace = true
 criterion = { version = "0.8", features = ["html_reports", "cargo_bench_support"] }
 rand = "0.9"
 rand_chacha = "0.9"
 rand_distr = "0.5"
+
+[features]
+# Off by default so `cargo test` doesn't pull in the C toolchain.
+bench-compare = ["dep:bench-compat"]
 
 [[bench]]
 name = "bench_read"
@@ -52,3 +60,8 @@ harness = false
 [[bench]]
 name = "bench_admin"
 harness = false
+
+[[bench]]
+name = "bench_compare"
+harness = false
+required-features = ["bench-compare"]
