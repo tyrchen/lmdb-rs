@@ -10,6 +10,7 @@ use crate::{
     cursor::Cursor,
     env::EnvironmentInner,
     error::{Error, Result},
+    page::Page,
     types::*,
 };
 
@@ -428,10 +429,63 @@ impl<'txn, 'env> RoCursor<'txn, 'env> {
                 self.dup_idx = 0;
                 self.sync_dup_count();
             }
-            _ => return Err(Error::Incompatible),
+            CursorOp::GetMultiple | CursorOp::NextMultiple => {
+                if op == CursorOp::NextMultiple {
+                    // Advance to the next key first.
+                    self.cursor.next(&get_page)?;
+                    self.dup_idx = 0;
+                    self.sync_dup_count();
+                } else if !self.cursor.is_initialized() {
+                    return Err(Error::NotFound);
+                }
+                return self.get_multiple_kv();
+            }
+            CursorOp::PrevMultiple => {
+                self.cursor.prev(&get_page)?;
+                self.dup_idx = 0;
+                self.sync_dup_count();
+                return self.get_multiple_kv();
+            }
         }
 
         self.current_kv()
+    }
+
+    /// Return all DUPFIXED values at the current position as a contiguous
+    /// byte slice.
+    ///
+    /// For `DUPFIXED` databases, the sub-page stores values contiguously
+    /// without node headers (LEAF2 format). This returns the key and the
+    /// raw data area containing all dup values packed together.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Incompatible`] if the current node is not a DUPFIXED
+    /// sub-page. Returns [`Error::NotFound`] if the cursor is not positioned.
+    fn get_multiple_kv(&self) -> Result<(&'txn [u8], &'txn [u8])> {
+        let node = self.cursor.current_node().ok_or(Error::NotFound)?;
+        if !node.is_dupdata() {
+            return Err(Error::Incompatible);
+        }
+
+        let sub_page_data = node.node_data();
+        let page = Page::from_raw(sub_page_data);
+        if !page.is_leaf2() {
+            return Err(Error::Incompatible);
+        }
+
+        // SAFETY: node data comes from the mmap which has lifetime >= 'env >= 'txn.
+        let key: &'txn [u8] = unsafe { std::mem::transmute::<&[u8], &[u8]>(node.key()) };
+
+        let val_size = page.pad() as usize;
+        let num_vals = page.num_keys();
+        let data_len = num_vals * val_size;
+        let data: &'txn [u8] = unsafe {
+            std::mem::transmute::<&[u8], &[u8]>(
+                &sub_page_data[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + data_len],
+            )
+        };
+        Ok((key, data))
     }
 
     /// Synchronize the dup_count from the current node.

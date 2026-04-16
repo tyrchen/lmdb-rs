@@ -286,6 +286,11 @@ pub(crate) struct EnvironmentInner {
     pub(crate) reader_table: ReaderTable,
     /// Lock file for cross-process writer serialization.
     pub(crate) lock_file: Option<File>,
+    /// Separate file handle opened with O_DSYNC (or equivalent) for meta
+    /// page writes. Ensures atomic durability of the commit point without
+    /// needing a separate fdatasync call for the meta write.
+    #[cfg(unix)]
+    pub(crate) meta_file: Option<File>,
 }
 
 // SAFETY: The raw mmap pointer is only accessed through methods that uphold
@@ -401,6 +406,17 @@ impl EnvironmentInner {
     pub(crate) fn data_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
         self._data_file.as_raw_fd()
+    }
+
+    /// Return the raw file descriptor of the meta file (O_DSYNC), falling
+    /// back to the regular data fd if unavailable.
+    #[cfg(unix)]
+    pub(crate) fn meta_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        match &self.meta_file {
+            Some(f) => f.as_raw_fd(),
+            None => self._data_file.as_raw_fd(),
+        }
     }
 
     /// Return the raw mmap pointer (for WRITEMAP mode).
@@ -577,6 +593,32 @@ impl Environment {
         };
 
         // ------------------------------------------------------------------
+        // 6b. Open a separate file handle with O_DSYNC for meta page writes.
+        //     On macOS, O_DSYNC is not widely supported, so we skip this
+        //     optimization and rely on F_FULLFSYNC in sync_data() instead.
+        // ------------------------------------------------------------------
+        #[cfg(unix)]
+        let meta_file = if !read_only && !config.flags.contains(EnvFlags::NO_SYNC) {
+            #[cfg(not(target_os = "macos"))]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_DSYNC)
+                    .open(&data_path)
+                    .ok()
+            }
+            #[cfg(target_os = "macos")]
+            {
+                // macOS does not honor O_DSYNC reliably; use F_FULLFSYNC instead.
+                None
+            }
+        } else {
+            None
+        };
+
+        // ------------------------------------------------------------------
         // 6. Memory-map the data file
         // ------------------------------------------------------------------
         let mmap = if read_only {
@@ -643,6 +685,8 @@ impl Environment {
             write_mutex: Mutex::new(()),
             reader_table: ReaderTable::new(config.max_readers),
             lock_file,
+            #[cfg(unix)]
+            meta_file,
         };
 
         Ok(Self {
@@ -717,6 +761,77 @@ impl Environment {
     /// Environment flags.
     pub fn flags(&self) -> EnvFlags {
         self.inner.flags
+    }
+
+    /// Resize the memory map logical limit.
+    ///
+    /// Must be called when no transactions are active. If `size` is 0, adopts
+    /// the size from the current meta page. Silently rounds up to the minimum
+    /// size needed for committed data.
+    ///
+    /// The new size cannot exceed the original mmap allocation. To grow beyond
+    /// the original size, reopen the environment with a larger `map_size`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MapResized`] if `size` exceeds the current mmap size.
+    pub fn set_mapsize(&self, size: usize) -> Result<()> {
+        let meta = self.inner.meta();
+        let page_size = self.inner.page_size;
+        let min_size = (meta.last_pgno as usize + 1) * page_size;
+        let new_size = if size == 0 {
+            meta.map_size as usize
+        } else {
+            size.max(min_size)
+        };
+
+        if new_size > self.inner.map_size {
+            return Err(Error::MapResized);
+        }
+
+        // Shrink the logical limit (pages beyond new_size won't be allocated).
+        // SAFETY: We require the caller to ensure no transactions are active.
+        // The write is to a usize-aligned field, and the single-writer
+        // constraint prevents data races.
+        let inner_ptr = Arc::as_ptr(&self.inner).cast_mut();
+        unsafe {
+            (*inner_ptr).max_pgno = (new_size / page_size).saturating_sub(1) as u64;
+        }
+        Ok(())
+    }
+
+    /// Set or clear environment flags at runtime.
+    ///
+    /// Only certain flags can be changed after open: `NO_SYNC`, `NO_META_SYNC`,
+    /// `MAP_ASYNC`, and `NO_MEM_INIT`. Attempting to change other flags returns
+    /// [`Error::Incompatible`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Incompatible`] if `flags` contains non-changeable flags.
+    pub fn set_flags(&self, flags: EnvFlags, on: bool) -> Result<()> {
+        const CHANGEABLE: EnvFlags = EnvFlags::NO_SYNC
+            .union(EnvFlags::NO_META_SYNC)
+            .union(EnvFlags::MAP_ASYNC)
+            .union(EnvFlags::NO_MEM_INIT);
+
+        if !CHANGEABLE.contains(flags) {
+            return Err(Error::Incompatible);
+        }
+
+        // SAFETY: Only changeable runtime flags are modified. The caller must
+        // ensure no transactions are concurrently reading `flags`, which is
+        // guaranteed by the single-writer constraint and the requirement that
+        // flags are set before or between transactions.
+        let inner_ptr = Arc::as_ptr(&self.inner).cast_mut();
+        unsafe {
+            if on {
+                (*inner_ptr).flags |= flags;
+            } else {
+                (*inner_ptr).flags &= !flags;
+            }
+        }
+        Ok(())
     }
 
     /// Close a named database handle.
@@ -1198,6 +1313,7 @@ fn empty_free_dbstat(page_size: u32) -> DbStat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::WriteFlags;
 
     #[test]
     fn test_should_create_default_builder() {
@@ -1319,7 +1435,7 @@ mod tests {
                 let key = format!("key_{i:04}");
                 let val = format!("val_{i:04}");
                 txn.put(
-                    MAIN_DBI as u32,
+                    MAIN_DBI,
                     key.as_bytes(),
                     val.as_bytes(),
                     crate::types::WriteFlags::empty(),
@@ -1344,7 +1460,7 @@ mod tests {
         for i in 0..100 {
             let key = format!("key_{i:04}");
             let expected = format!("val_{i:04}");
-            let val = txn.get(MAIN_DBI as u32, key.as_bytes()).expect("get");
+            let val = txn.get(MAIN_DBI, key.as_bytes()).expect("get");
             assert_eq!(val, expected.as_bytes(), "mismatch for {key}");
         }
     }
@@ -1364,7 +1480,7 @@ mod tests {
                 let key = format!("key_{i:04}");
                 let val = format!("val_{i:04}");
                 txn.put(
-                    MAIN_DBI as u32,
+                    MAIN_DBI,
                     key.as_bytes(),
                     val.as_bytes(),
                     crate::types::WriteFlags::empty(),
@@ -1377,7 +1493,7 @@ mod tests {
             let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
             for i in 0..100 {
                 let key = format!("key_{i:04}");
-                txn.del(MAIN_DBI as u32, key.as_bytes(), None).expect("del");
+                txn.del(MAIN_DBI, key.as_bytes(), None).expect("del");
             }
             txn.commit().expect("commit");
         }
@@ -1394,6 +1510,86 @@ mod tests {
         assert!(
             compact_size <= plain_size,
             "compact ({compact_size}) should be <= plain ({plain_size})",
+        );
+    }
+
+    #[test]
+    fn test_should_set_mapsize() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(2 * 1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        // Insert some data to advance last_pgno.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI, b"key", b"value", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        // Shrink to 1 MiB (still within the original 2 MiB mmap).
+        env.set_mapsize(1024 * 1024).expect("set_mapsize");
+
+        // Verify we can still write within the new limit.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI, b"key2", b"value2", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        // Attempting to grow beyond the original mmap should fail.
+        let result = env.set_mapsize(4 * 1024 * 1024);
+        assert!(
+            matches!(result, Err(Error::MapResized)),
+            "expected MapResized, got {result:?}",
+        );
+
+        // Size 0 should adopt from the meta page.
+        env.set_mapsize(0).expect("set_mapsize(0)");
+    }
+
+    #[test]
+    fn test_should_set_flags_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        // Initially NO_SYNC is not set.
+        assert!(!env.flags().contains(EnvFlags::NO_SYNC));
+
+        // Enable NO_SYNC.
+        env.set_flags(EnvFlags::NO_SYNC, true)
+            .expect("set NO_SYNC on");
+        assert!(env.flags().contains(EnvFlags::NO_SYNC));
+
+        // Write with NO_SYNC enabled.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(MAIN_DBI, b"fast", b"write", WriteFlags::empty())
+                .expect("put");
+            txn.commit().expect("commit");
+        }
+
+        // Disable NO_SYNC.
+        env.set_flags(EnvFlags::NO_SYNC, false)
+            .expect("set NO_SYNC off");
+        assert!(!env.flags().contains(EnvFlags::NO_SYNC));
+
+        // Toggle NO_META_SYNC.
+        env.set_flags(EnvFlags::NO_META_SYNC, true)
+            .expect("set NO_META_SYNC on");
+        assert!(env.flags().contains(EnvFlags::NO_META_SYNC));
+
+        // Attempting to change a non-changeable flag should fail.
+        let result = env.set_flags(EnvFlags::READ_ONLY, true);
+        assert!(
+            matches!(result, Err(Error::Incompatible)),
+            "expected Incompatible, got {result:?}",
         );
     }
 }

@@ -411,13 +411,38 @@ impl<'env> RwTransaction<'env> {
     /// Allocate `num` contiguous page buffers.
     ///
     /// Returns the starting page number and a vector of page buffers.
-    /// All pages are allocated from `next_pgno` in a contiguous range.
+    /// First searches the reclaim list for a contiguous run of pages,
+    /// then falls back to extending the file by bumping `next_pgno`.
     ///
     /// # Errors
     ///
     /// Returns [`Error::MapFull`] if the database has reached the map size limit.
     pub(crate) fn page_alloc_multi(&mut self, num: usize) -> Result<(u64, Vec<PageBuf>)> {
         self.maybe_spill()?;
+
+        // Try to find contiguous pages in the reclaim list.
+        if !self.reclaim_pgs.is_empty() && num > 1 {
+            self.reclaim_pgs.sort_unstable();
+
+            let mut run_len = 1usize;
+            for i in 1..self.reclaim_pgs.len() {
+                if self.reclaim_pgs[i] == self.reclaim_pgs[i - 1] + 1 {
+                    run_len += 1;
+                    if run_len >= num {
+                        let start_idx = i + 1 - num;
+                        let pgno = self.reclaim_pgs[start_idx];
+                        self.reclaim_pgs.drain(start_idx..start_idx + num);
+                        let bufs: Vec<PageBuf> =
+                            (0..num).map(|_| PageBuf::new(self.env.page_size)).collect();
+                        return Ok((pgno, bufs));
+                    }
+                } else {
+                    run_len = 1;
+                }
+            }
+        }
+
+        // Fall back to extending the file.
         let start_pgno = self.next_pgno;
         if start_pgno + num as u64 > self.env.max_pgno {
             return Err(Error::MapFull);
@@ -984,14 +1009,20 @@ impl<'env> RwTransaction<'env> {
         // 3. Flush dirty pages to the data file
         self.flush_dirty_pages()?;
 
-        // 4. Sync data pages to disk
-        self.sync_data()?;
+        // 4. Sync data pages to disk (skip if NO_SYNC)
+        if !self.env.flags.contains(EnvFlags::NO_SYNC) {
+            self.sync_data()?;
+        }
 
         // 5. Write the new meta page (the commit point)
         self.write_meta()?;
 
-        // 6. Sync meta page to disk
-        self.sync_data()?;
+        // 6. Sync meta page to disk (skip if NO_SYNC or NO_META_SYNC)
+        if !self.env.flags.contains(EnvFlags::NO_SYNC)
+            && !self.env.flags.contains(EnvFlags::NO_META_SYNC)
+        {
+            self.sync_data()?;
+        }
 
         Ok(())
     }
@@ -1385,17 +1416,49 @@ impl<'env> RwTransaction<'env> {
             }
             Ok(())
         } else {
-            // Normal mode: pwrite each dirty page.
+            // Normal mode: use pwritev for contiguous page runs, pwrite
+            // for isolated pages.
             let fd = self.env.data_fd();
-            for (pgno, buf) in self.dirty.iter() {
-                let offset = *pgno as i64 * page_size as i64;
-                let data = buf.as_slice();
-                // SAFETY: fd is a valid file descriptor from the environment's
-                // data file. data points to a valid buffer for data.len() bytes.
-                let written = unsafe { libc::pwrite(fd, data.as_ptr().cast(), data.len(), offset) };
-                if written < 0 || written as usize != data.len() {
-                    return Err(Error::Io(std::io::Error::last_os_error()));
+            let entries: Vec<_> = self.dirty.iter().collect();
+            let mut i = 0;
+            while i < entries.len() {
+                let start_pgno = entries[i].0;
+                let mut end = i + 1;
+                // Find contiguous run (pgnos must be sequential).
+                while end < entries.len()
+                    && entries[end].0 == entries[end - 1].0 + 1
+                    && end - i < COMMIT_PAGES
+                {
+                    end += 1;
                 }
+
+                let offset = start_pgno as i64 * page_size as i64;
+                if end - i == 1 {
+                    // Single page: pwrite.
+                    let data = entries[i].1.as_slice();
+                    // SAFETY: fd is a valid file descriptor. data is a valid buffer.
+                    let written =
+                        unsafe { libc::pwrite(fd, data.as_ptr().cast(), data.len(), offset) };
+                    if written < 0 || written as usize != data.len() {
+                        return Err(Error::Io(std::io::Error::last_os_error()));
+                    }
+                } else {
+                    // Multiple contiguous pages: pwritev.
+                    let iovecs: Vec<libc::iovec> = (i..end)
+                        .map(|j| libc::iovec {
+                            iov_base: entries[j].1.as_slice().as_ptr() as *mut _,
+                            iov_len: entries[j].1.as_slice().len(),
+                        })
+                        .collect();
+                    let total_len: usize = iovecs.iter().map(|v| v.iov_len).sum();
+                    // SAFETY: fd is valid, iovecs point to valid page buffers.
+                    let written =
+                        unsafe { libc::pwritev(fd, iovecs.as_ptr(), iovecs.len() as i32, offset) };
+                    if written < 0 || written as usize != total_len {
+                        return Err(Error::Io(std::io::Error::last_os_error()));
+                    }
+                }
+                i = end;
             }
             Ok(())
         }
@@ -1485,8 +1548,9 @@ impl<'env> RwTransaction<'env> {
                 return Err(Error::Io(std::io::Error::last_os_error()));
             }
         } else {
-            // Normal mode: pwrite the meta page.
-            let fd = self.env.data_fd();
+            // Normal mode: pwrite the meta page using the O_DSYNC fd when
+            // available, so the meta write is atomically durable.
+            let fd = self.env.meta_fd();
             let offset = (toggle * page_size) as i64;
             // SAFETY: fd is a valid file descriptor. meta_buf is a valid buffer.
             let written =
@@ -2985,9 +3049,9 @@ mod tests {
             );
 
             // Verify sorted order.
-            for i in 0..collected.len() {
+            for (i, item) in collected.iter().enumerate() {
                 let expected = format!("dup-{i:04}");
-                assert_eq!(collected[i], expected.as_bytes(), "mismatch at dup {i}",);
+                assert_eq!(item, &expected.as_bytes(), "mismatch at dup {i}",);
             }
         }
     }
@@ -3958,8 +4022,7 @@ mod tests {
             let dbi = txn.open_db(Some("revcmp")).expect("open_db ro");
             let mut cursor = txn.open_cursor(dbi).expect("open_cursor");
             let mut keys: Vec<Vec<u8>> = Vec::new();
-            let mut it = cursor.iter();
-            while let Some(result) = it.next() {
+            for result in cursor.iter() {
                 let (k, _) = result.expect("iter");
                 keys.push(k.to_vec());
             }
@@ -3968,6 +4031,205 @@ mod tests {
                 vec![b"ccc".to_vec(), b"bbb".to_vec(), b"aaa".to_vec()],
                 "keys should be in reverse order with custom comparator",
             );
+        }
+    }
+
+    #[test]
+    fn test_should_handle_no_meta_sync() {
+        use crate::env::EnvFlags;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        // Enable NO_META_SYNC (skip the meta page fdatasync).
+        env.set_flags(EnvFlags::NO_META_SYNC, true)
+            .expect("set NO_META_SYNC");
+
+        // Write and commit several keys.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            for i in 0..50 {
+                let key = format!("nms_key_{i:04}");
+                let val = format!("nms_val_{i:04}");
+                txn.put(
+                    MAIN_DBI as u32,
+                    key.as_bytes(),
+                    val.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .expect("put");
+            }
+            txn.commit().expect("commit with NO_META_SYNC");
+        }
+
+        // Read back and verify.
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            for i in 0..50 {
+                let key = format!("nms_key_{i:04}");
+                let val = format!("nms_val_{i:04}");
+                let got = txn
+                    .get(MAIN_DBI as u32, key.as_bytes())
+                    .expect("get after NO_META_SYNC commit");
+                assert_eq!(got, val.as_bytes());
+            }
+        }
+
+        // Disable NO_META_SYNC and write again.
+        env.set_flags(EnvFlags::NO_META_SYNC, false)
+            .expect("clear NO_META_SYNC");
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(
+                MAIN_DBI as u32,
+                b"after_nms",
+                b"synced",
+                WriteFlags::empty(),
+            )
+            .expect("put");
+            txn.commit().expect("commit");
+        }
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            assert_eq!(
+                txn.get(MAIN_DBI as u32, b"after_nms").expect("get"),
+                b"synced",
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_reuse_contiguous_overflow_pages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(4 * 1024 * 1024)
+            .open(dir.path())
+            .expect("open");
+
+        // Write a large value that requires overflow pages.
+        let big_val = vec![0xABu8; 8192]; // > 4096, needs overflow pages
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(
+                MAIN_DBI as u32,
+                b"overflow_key",
+                &big_val,
+                WriteFlags::empty(),
+            )
+            .expect("put overflow");
+            txn.commit().expect("commit");
+        }
+
+        // Record the page count.
+        let info_before = env.info();
+
+        // Delete the overflow entry — frees the overflow pages.
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.del(MAIN_DBI as u32, b"overflow_key", None)
+                .expect("del overflow");
+            txn.commit().expect("commit delete");
+        }
+
+        // Write another large value — freed pages should be reusable
+        // for future allocations (not necessarily the overflow itself,
+        // but the freed pages enter the reclaim list).
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            txn.put(
+                MAIN_DBI as u32,
+                b"overflow_key2",
+                &big_val,
+                WriteFlags::empty(),
+            )
+            .expect("put overflow2");
+            txn.commit().expect("commit overflow2");
+        }
+
+        // The database should not have grown unboundedly.
+        let info_after = env.info();
+        // Allow some growth for the free-list record itself.
+        assert!(
+            info_after.last_pgno <= info_before.last_pgno + 10,
+            "database grew too much: before={}, after={}",
+            info_before.last_pgno,
+            info_after.last_pgno,
+        );
+
+        // Verify the new value reads back correctly.
+        {
+            let txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let val = txn
+                .get(MAIN_DBI as u32, b"overflow_key2")
+                .expect("get overflow2");
+            assert_eq!(val, &big_val);
+        }
+    }
+
+    #[test]
+    fn test_should_get_multiple_dupfixed() {
+        use crate::types::{CursorOp, DatabaseFlags};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = Environment::builder()
+            .map_size(1024 * 1024)
+            .max_dbs(4)
+            .open(dir.path())
+            .expect("open");
+
+        // Create a DUPSORT + DUPFIXED database.
+        let dbi;
+        {
+            let mut txn = env.begin_rw_txn().expect("begin_rw_txn");
+            dbi = txn
+                .open_db(
+                    Some("dupfixed"),
+                    DatabaseFlags::CREATE | DatabaseFlags::DUP_SORT | DatabaseFlags::DUP_FIXED,
+                )
+                .expect("open_db");
+
+            // Insert several fixed-size dup values (4 bytes each).
+            for i in 0u32..10 {
+                txn.put(dbi, b"mykey", &i.to_le_bytes(), WriteFlags::empty())
+                    .expect("put dup");
+            }
+            txn.commit().expect("commit");
+        }
+
+        // Read back with GetMultiple.
+        {
+            let mut txn = env.begin_ro_txn().expect("begin_ro_txn");
+            let dbi = txn.open_db(Some("dupfixed")).expect("open_db ro");
+            let mut cursor = txn.open_cursor(dbi).expect("open_cursor");
+
+            // First position at the key.
+            let (key, _val) = cursor
+                .get(Some(b"mykey"), CursorOp::Set)
+                .expect("set mykey");
+            assert_eq!(key, b"mykey");
+
+            // GetMultiple should return all dup values as contiguous data.
+            let (key2, multi_data) = cursor
+                .get(None, CursorOp::GetMultiple)
+                .expect("get_multiple");
+            assert_eq!(key2, b"mykey");
+
+            // Each dup value is 4 bytes, we inserted 10.
+            assert_eq!(multi_data.len(), 40);
+
+            // Verify each value.
+            for i in 0u32..10 {
+                let expected = i.to_le_bytes();
+                let offset = i as usize * 4;
+                assert_eq!(
+                    &multi_data[offset..offset + 4],
+                    &expected,
+                    "dup value {i} mismatch",
+                );
+            }
         }
     }
 }

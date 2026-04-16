@@ -227,7 +227,7 @@ fn test_rw_large_values_mixed() {
         let mut txn = env.begin_rw_txn().expect("rw");
         for &size in &sizes {
             let key = format!("blob:{size:06}");
-            let val = vec![((size % 256) as u8); size];
+            let val = vec![(size % 256) as u8; size];
             txn.put(MAIN_DBI, key.as_bytes(), &val, WriteFlags::empty())
                 .expect("put");
         }

@@ -288,7 +288,7 @@ fn test_fp_overflow_with_page_reuse() {
         txn.commit().expect("commit");
     }
 
-    let info_before = env.info();
+    let _info_before = env.info();
 
     // Delete half
     {
@@ -652,17 +652,18 @@ fn test_fp_write_cursor_put() {
 
     {
         let mut txn = env.begin_rw_txn().expect("rw");
-        let mut cursor = txn.open_rw_cursor(MAIN_DBI).expect("cursor");
-        cursor
-            .put(b"key1", b"val1", WriteFlags::empty())
-            .expect("put");
-        cursor
-            .put(b"key2", b"val2", WriteFlags::empty())
-            .expect("put");
-        cursor
-            .put(b"key3", b"val3", WriteFlags::empty())
-            .expect("put");
-        drop(cursor);
+        {
+            let mut cursor = txn.open_rw_cursor(MAIN_DBI).expect("cursor");
+            cursor
+                .put(b"key1", b"val1", WriteFlags::empty())
+                .expect("put");
+            cursor
+                .put(b"key2", b"val2", WriteFlags::empty())
+                .expect("put");
+            cursor
+                .put(b"key3", b"val3", WriteFlags::empty())
+                .expect("put");
+        }
         txn.commit().expect("commit");
     }
 
