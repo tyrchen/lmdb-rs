@@ -276,13 +276,19 @@ pub fn cursor_put_with_flags(
         if !needs_overflow {
             let db_is_dupsort = db.flags & DatabaseFlags::DUP_SORT.bits() as u16 != 0;
             if !db_is_dupsort {
-                txn.put_hint = Some(PutHint {
-                    dbi,
-                    root_pgno,
-                    leaf_pgno: root_pgno,
-                    is_rightmost: true,
-                    last_key: key.to_vec(),
-                });
+                // Refetch the just-inserted PageBuf to grab a stable pointer
+                // into its Vec<u8> heap storage.
+                if let Some(buf) = txn.dirty.find_mut(root_pgno) {
+                    let leaf_ptr = buf.as_mut_slice().as_mut_ptr();
+                    txn.put_hint = Some(PutHint {
+                        dbi,
+                        root_pgno,
+                        leaf_pgno: root_pgno,
+                        is_rightmost: true,
+                        last_key: key.to_vec(),
+                        leaf_ptr,
+                    });
+                }
             }
         }
         return Ok(());
@@ -306,54 +312,55 @@ pub fn cursor_put_with_flags(
     // hint, skip the root-to-leaf walk entirely.
     let db_is_dupsort_check = db.flags & DatabaseFlags::DUP_SORT.bits() as u16 != 0;
     if !db_is_dupsort_check && !needs_overflow && !flags.contains(WriteFlags::NO_DUP_DATA) {
+        // Snapshot the raw leaf pointer out of the hint so we can skip
+        // the `dirty.find_mut` binary search on the hot path. The pointer
+        // was captured when this hint was populated; it's valid as long
+        // as no hint-invalidating op has run since (see PutHint docs).
         let hint_leaf = match &txn.put_hint {
             Some(h)
                 if h.dbi == dbi
                     && h.root_pgno == db.root
                     && h.is_rightmost
+                    && !h.leaf_ptr.is_null()
                     && (**cmp)(key, &h.last_key) == Ordering::Greater =>
             {
-                Some(h.leaf_pgno)
+                Some(h.leaf_ptr)
             }
             _ => None,
         };
 
-        if let Some(leaf_pgno) = hint_leaf {
-            if let Some(buf) = txn.dirty.find_mut(leaf_pgno) {
-                let insert_idx = buf.as_page().num_keys();
-                let add = node_add(
-                    buf.as_mut_slice(),
-                    page_size,
-                    insert_idx,
-                    key,
-                    data,
-                    0,
-                    node_flags,
-                );
-                match add {
-                    Ok(()) => {
-                        let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
-                        db_mut.entries += 1;
-                        txn.db_dirty[dbi as usize] = true;
-                        // We appended at the end of a rightmost leaf —
-                        // refresh last_key in-place without dropping the hint.
-                        if let Some(h) = txn.put_hint.as_mut() {
-                            h.last_key.clear();
-                            h.last_key.extend_from_slice(key);
-                        }
-                        return Ok(());
+        if let Some(leaf_ptr) = hint_leaf {
+            // SAFETY: `leaf_ptr` was captured from a `PageBuf` held in
+            // `DirtyPages`. The `PageBuf` owns a `Vec<u8>` of fixed
+            // `page_size` capacity; its heap storage address is stable
+            // for the Vec's lifetime. The hint is invalidated by every
+            // op that could remove the PageBuf (spill, explicit remove,
+            // commit/abort, cursor-level mutation, del/reserve/etc).
+            // RwTransaction is single-threaded, so no concurrent
+            // access is possible.
+            let buf_slice = unsafe { std::slice::from_raw_parts_mut(leaf_ptr, page_size) };
+            let insert_idx = Page::from_raw(buf_slice).num_keys();
+            let add = node_add(buf_slice, page_size, insert_idx, key, data, 0, node_flags);
+            match add {
+                Ok(()) => {
+                    let db_mut = txn.dbs.get_mut(dbi as usize).ok_or(Error::BadDbi)?;
+                    db_mut.entries += 1;
+                    txn.db_dirty[dbi as usize] = true;
+                    // Appended at the end of a rightmost leaf — refresh
+                    // `last_key` in place without dropping the hint.
+                    if let Some(h) = txn.put_hint.as_mut() {
+                        h.last_key.clear();
+                        h.last_key.extend_from_slice(key);
                     }
-                    Err(Error::PageFull) => {
-                        // Leaf is full — we need a split. Invalidate the
-                        // hint; the slow path below will re-populate if the
-                        // split's target leaf is still rightmost.
-                        txn.put_hint = None;
-                    }
-                    Err(e) => return Err(e),
+                    return Ok(());
                 }
-            } else {
-                // Leaf was evicted (page spill) — drop the hint.
-                txn.put_hint = None;
+                Err(Error::PageFull) => {
+                    // Leaf is full — we need a split. Invalidate the
+                    // hint; the slow path below will re-populate if the
+                    // split's target leaf is still rightmost.
+                    txn.put_hint = None;
+                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -472,13 +479,25 @@ pub fn cursor_put_with_flags(
                 // overwriting. These are the conditions the fast-path check
                 // later relies on.
                 if is_rightmost && !overwrite && !db_is_dupsort && insert_idx == nkeys {
-                    txn.put_hint = Some(PutHint {
-                        dbi,
-                        root_pgno: path[0].pgno,
-                        leaf_pgno,
-                        is_rightmost: true,
-                        last_key: key.to_vec(),
-                    });
+                    // Grab a stable raw pointer into the leaf PageBuf so the
+                    // next fast-path put can skip the `dirty.find_mut`.
+                    let leaf_ptr = txn
+                        .dirty
+                        .find_mut(leaf_pgno)
+                        .map(|b| b.as_mut_slice().as_mut_ptr())
+                        .unwrap_or(std::ptr::null_mut());
+                    if !leaf_ptr.is_null() {
+                        txn.put_hint = Some(PutHint {
+                            dbi,
+                            root_pgno: path[0].pgno,
+                            leaf_pgno,
+                            is_rightmost: true,
+                            last_key: key.to_vec(),
+                            leaf_ptr,
+                        });
+                    } else {
+                        txn.put_hint = None;
+                    }
                 } else {
                     txn.put_hint = None;
                 }

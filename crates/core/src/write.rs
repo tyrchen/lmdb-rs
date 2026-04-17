@@ -231,17 +231,39 @@ struct SavePoint {
 ///   duplicate and insertion belongs at position `nkeys`.
 ///
 /// Any mutation the fast-path can't reason about (delete, reserve,
-/// DUPSORT put, nested-txn rollback, cursor-level mutation) invalidates
-/// the hint. It is only *populated* after the slow path has already
-/// validated the invariants the fast-path relies on.
+/// DUPSORT put, nested-txn rollback, cursor-level mutation, page spill)
+/// invalidates the hint. It is only *populated* after the slow path has
+/// already validated the invariants the fast-path relies on.
+///
+/// `leaf_ptr` is a raw pointer directly into the leaf `PageBuf`'s heap
+/// storage. It lets the fast path skip the `dirty.find_mut` binary
+/// search — the dominant remaining cost in the 50K-seq-put hot loop
+/// after the cmp/hint/branch-update work was already inlined.
 #[derive(Debug)]
 pub(crate) struct PutHint {
     pub(crate) dbi: u32,
     pub(crate) root_pgno: u64,
+    /// Kept for diagnostics and symmetry with C LMDB's cursor stack.
+    /// The fast path now uses `leaf_ptr` directly so `leaf_pgno` isn't
+    /// read on the hot path — hence `#[allow(dead_code)]`.
+    #[allow(dead_code)]
     pub(crate) leaf_pgno: u64,
     pub(crate) is_rightmost: bool,
     pub(crate) last_key: Vec<u8>,
+    /// Raw pointer into the leaf `PageBuf`'s heap storage. Valid as
+    /// long as the PageBuf stays in `DirtyPages`. Invalidated by spill,
+    /// explicit remove, and commit/abort — all of which also clear the
+    /// hint. The pointer lives *inside* a `Vec<u8>` whose capacity is
+    /// fixed at `page_size`, so its heap address is stable even when
+    /// the outer `DirtyPages.entries` Vec grows.
+    pub(crate) leaf_ptr: *mut u8,
 }
+
+// Writer transactions are single-threaded (holding a MutexGuard), so
+// PutHint never crosses a thread boundary in practice. The `Send` impl
+// acknowledges the compiler's auto-trait refusal for raw pointers;
+// there is no sharing semantics to protect.
+unsafe impl Send for PutHint {}
 
 // ---------------------------------------------------------------------------
 // RwTransaction
